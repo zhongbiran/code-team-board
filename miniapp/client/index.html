@@ -279,6 +279,36 @@ td.n { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .field input:focus, .field select:focus { outline: 2px solid var(--mcode-accent); outline-offset: -1px; }
 .field input.mono { font-family: 'JetBrains Mono', Consolas, monospace; }
+.field textarea {
+  font: inherit; font-size: 12.5px; padding: 7px 9px; resize: vertical;
+  border: 1px solid var(--mcode-border); border-radius: 6px;
+  background: var(--mcode-surface-muted); color: var(--mcode-text); width: 100%;
+}
+.field textarea:focus { outline: 2px solid var(--mcode-accent); outline-offset: -1px; }
+/* 不可编辑值：虚线框表示"只能看，不能改" */
+.field .fixed {
+  font-size: 12.5px; padding: 7px 9px; word-break: break-all;
+  border: 1px dashed var(--mcode-border); border-radius: 6px;
+  background: var(--mcode-surface-muted); color: var(--mcode-text-muted);
+}
+.field[data-state='unsupported'] input,
+.field[data-state='unsupported'] select,
+.field[data-state='unsupported'] textarea { opacity: .5; }
+.fhint { font-size: 11px; color: var(--mcode-text-subtle); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.fhint .tag {
+  padding: 1px 6px; border-radius: 4px; text-transform: none;
+  border: 1px solid var(--mcode-border); background: var(--mcode-surface-muted);
+}
+.fhint .tag.warn { color: var(--mcode-warning); border-color: var(--mcode-warning); }
+.rc-foot {
+  border-top: 1px solid var(--mcode-border); margin-top: 11px; padding-top: 9px;
+  font-size: 11px; color: var(--mcode-text-subtle); display: flex; flex-direction: column; gap: 4px;
+}
+.rc-foot .cmd {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  background: var(--mcode-surface-muted); padding: 4px 7px; border-radius: 5px;
+  border: 1px solid var(--mcode-border); word-break: break-all;
+}
 
 .actions { display: flex; align-items: center; gap: 10px; padding-top: 6px; }
 button.primary {
@@ -392,8 +422,9 @@ button.ghost:hover { background: var(--mcode-surface-muted); }
   <!-- 配置 -->
   <section class="view" id="v-config" role="tabpanel" aria-labelledby="t-config" hidden>
     <div class="panel">
-      <header><h2>角色配置</h2><span class="hint">改动写回插件的 config/team.json，下次调用生效</span></header>
+      <header><h2>角色配置</h2><span class="hint">字段与可写范围来自后端能力描述，只显示实际支持的项</span></header>
       <div class="body">
+        <div id="cap-banner"></div>
         <div class="form-grid" id="roles-form"></div>
         <div class="actions">
           <button class="primary" id="save">保存</button>
@@ -542,33 +573,221 @@ function renderRaw(recent) {
       '</tr>').join('') + '</tbody>';
 }
 
-/* ── 配置表单 ── */
-function renderConfig(cfg) {
-  const roles = cfg.roles ?? {};
-  $('roles-form').innerHTML = Object.entries(roles).map(([key, r]) => {
-    const efforts = ['low','medium','high','xhigh','max','ultra'];
-    const isCli = r.backend === 'codex-cli';
-    return '<div class="role-card">' +
-      '<div class="rc-head"><span class="dot" style="background:' + colorOf(key) + '"></span>' +
-      '<b style="font-size:13px">' + esc(r.label ?? key) + '</b>' +
-      '<span class="rc-kind">' + esc(r.kind ?? '') + '</span></div>' +
-      '<div class="rc-note">' + esc(r.note ?? '') + '</div>' +
-      '<div class="field"><label>后端</label>' +
-      '<select data-r="' + esc(key) + '" data-f="backend">' +
-      '<option value="codex-cli"' + (isCli ? ' selected' : '') + '>codex-cli（本机 Codex）</option>' +
-      '<option value="mcode-agent"' + (!isCli ? ' selected' : '') + '>mcode-agent（MCode 子代理）</option>' +
-      '</select></div>' +
-      '<div class="field"><label>模型</label>' +
-      '<input class="mono" data-r="' + esc(key) + '" data-f="model" value="' + esc(r.model ?? '') + '" /></div>' +
-      (isCli
-        ? '<div class="field"><label>思考档位</label><select data-r="' + esc(key) + '" data-f="effort">' +
-          efforts.map((x) => '<option value="' + x + '"' + ((r.effort ?? 'medium') === x ? ' selected' : '') + '>' + x + '</option>').join('') +
-          '</select></div>'
-        : '<div class="field"><label>Agent</label><input class="mono" data-r="' + esc(key) + '" data-f="agent" value="' + esc(r.agent ?? '') + '" /></div>') +
-      '</div>';
-  }).join('');
+/* ── 配置：按后端能力渲染 ─────────────────────────────
+   字段、可写范围、默认值、缺依赖与修复动作全部来自 GET /api/config 的 capabilities。
+   前端不写死模型目录，也不假设某个品牌后端——换后端换模型，页面跟着能力描述变。
+   ───────────────────────────────────────────── */
+const EXEC_ROLES = new Set(['worker', 'explore', 'verifier']);
+const ROLE_ORDER = ['overmind', 'coder', 'worker', 'explore', 'verifier'];
+const FIELD_LABEL = { model: '模型', effort: '思考档位', executable: '可执行程序', args: '参数数组' };
+const PLACEHOLDER = { model: '{model}', effort: '{effort}' };
 
-  const a = cfg.alerts ?? {};
+const cfgState = { model: null, baseline: null, alerts: {} };
+
+const clone = (v) => (v === null || typeof v !== 'object') ? v
+  : Array.isArray(v) ? v.map(clone)
+  : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, clone(x)]));
+const sameValue = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+const showValue = (v) => (v === null || v === undefined) ? '（未设置）'
+  : (Array.isArray(v) ? JSON.stringify(v) : String(v));
+
+function freshValue(field) {
+  if (field.default !== null && field.default !== undefined) return field.default;
+  if (field.type === 'string[]') return [];
+  if (field.required) return '';
+  return null;
+}
+
+/** 内置执行角色只认 model 与 effort：其余字段连渲染都不渲染。 */
+function buildFields(role) {
+  const raw = role.spec?.fields ?? {};
+  return Object.entries(raw)
+    .filter(([name]) => !(EXEC_ROLES.has(role.key) && name !== 'model' && name !== 'effort'))
+    .map(([name, f]) => ({
+      name: name,
+      type: f?.type ?? 'string',
+      state: f?.state ?? 'unknown',
+      nullable: f?.nullable ?? true,
+      required: f?.required ?? false,
+      default: f?.default ?? null,
+      values: Array.isArray(f?.values) ? f.values : null,
+      reason: f?.reason ?? f?.detail ?? null,
+    }));
+}
+
+/**
+ * 能不能编辑：
+ * - 后端说 supported 才算；
+ * - 在有参数数组的后端上，模型/档位能不能传由参数数组里的完整占位元素决定
+ *   （后端能力也按同一条规则判定，所以本地跟着参数走）。
+ */
+function isEditable(role, field) {
+  const hasArgs = role.fields.some((f) => f.name === 'args');
+  if (hasArgs && PLACEHOLDER[field.name]) {
+    return (role.values.args ?? []).includes(PLACEHOLDER[field.name]);
+  }
+  return field.state === 'supported';
+}
+
+function buildConfigModel(payload) {
+  const config = payload?.config ?? payload ?? {};
+  const capabilities = payload?.capabilities ?? {};
+  const capRoles = capabilities.roles ?? {};
+  const cfgRoles = config.roles ?? {};
+  const keys = ROLE_ORDER.filter((k) => cfgRoles[k] || capRoles[k])
+    .concat(Object.keys(capRoles).filter((k) => !ROLE_ORDER.includes(k)));
+  const roles = {};
+  for (const key of keys) {
+    const rc = cfgRoles[key] ?? {};
+    const cap = capRoles[key] ?? {};
+    const options = (cap.backendOptions ?? []).map((o) => (typeof o === 'string'
+      ? { id: o, label: o, available: true, reason: null }
+      : { id: o.id ?? o.value ?? o, label: o.label ?? o.name ?? o.id, available: o.available !== false, reason: o.reason ?? null }));
+    const backends = cap.backends ?? {};
+    const backend = rc.backend ?? (options[0] ? options[0].id : null);
+    const role = {
+      key: key, rc: rc, backends: backends, options: options,
+      label: rc.label ?? key, kind: rc.kind ?? '', note: rc.note ?? '', agent: rc.agent ?? null,
+      backend: backend, spec: backends[backend] ?? null,
+      preflight: cap.preflight ?? capabilities.preflight?.[key] ?? null,
+      values: {}, errors: {},
+    };
+    role.fixedBackend = options.length <= 1;
+    role.fields = buildFields(role);
+    for (const f of role.fields) {
+      role.values[f.name] = rc[f.name] !== undefined ? rc[f.name] : freshValue(f);
+    }
+    roles[key] = role;
+  }
+  return { config: config, capabilities: capabilities, roles: roles };
+}
+
+function fixedHint(role) {
+  return EXEC_ROLES.has(role.key)
+    ? '内置执行角色：backend 与 agent 身份固定，只能改模型与档位'
+    : '此调用方式固定，不可更改';
+}
+
+function backendHint(role) {
+  const s = role.spec ?? {};
+  const bits = [];
+  bits.push(s.resume === 'thread-id' ? '支持同线程续问' : (s.resume === 'none' ? '不支持续问' : '续问能力未知'));
+  if (s.output) bits.push('输出格式 ' + s.output);
+  return bits.join(' · ');
+}
+
+function roleFoot(role) {
+  const lines = [];
+  lines.push('改动从下一次「' + esc(role.label) + ' 调用」开始生效，已在途的调用不受影响。');
+  if (!role.spec) {
+    lines.push('服务端没有返回这个角色的能力描述，暂无可编辑字段。');
+    return lines;
+  }
+  const pf = role.preflight;
+  if (!pf) {
+    lines.push('未做本地预检：服务端没有返回预检结果，依赖是否齐全由首次调用确认。');
+    return lines;
+  }
+  const statusText = { ready: '通过', blocked: '被阻塞', unknown: '无法本地判定' }[pf.status] ?? pf.status ?? '未知';
+  lines.push('预检：' + esc(statusText));
+  for (const c of (pf.checks ?? [])) {
+    if (!c || c.status === 'ok' || c.status === 'pass') continue;
+    lines.push('· ' + esc(c.detail ?? c.id ?? ''));
+  }
+  if (pf.nextStep && pf.nextStep.text) {
+    lines.push('修复动作：' + esc(pf.nextStep.text));
+    const cmd = pf.nextStep.command;
+    if (cmd) lines.push('<span class="cmd">' + esc(((cmd.executable ?? '') + ' ' + (cmd.args ?? []).join(' ')).trim()) + '</span>');
+  }
+  return lines;
+}
+
+function renderControl(role, field, value, editable) {
+  const attrs = 'data-r="' + esc(role.key) + '" data-f="' + esc(field.name) + '"' + (editable ? '' : ' disabled');
+  if (Array.isArray(field.values) && field.values.length) {
+    const opts = field.values.slice();
+    if (value !== null && value !== undefined && !opts.includes(value)) opts.push(value);
+    return '<select ' + attrs + '>' + opts.map((v) =>
+      '<option value="' + esc(v) + '"' + (v === value ? ' selected' : '') + '>' + esc(v) + '</option>').join('') + '</select>';
+  }
+  if (field.type === 'string[]') {
+    return '<textarea class="mono" rows="3" ' + attrs + '>' + esc(JSON.stringify(value ?? [], null, 1)) + '</textarea>';
+  }
+  return '<input class="mono" type="text" ' + attrs + ' value="' + esc(value ?? '') + '" />';
+}
+
+/** 说不支持的理由：优先用后端给的原因，没有就按占位元素规则推导一条。 */
+function reasonText(role, field) {
+  if (field.reason) return field.reason;
+  const hasArgs = role.fields.some((f) => f.name === 'args');
+  if (hasArgs && PLACEHOLDER[field.name]) {
+    return '参数数组里没有完整的 ' + PLACEHOLDER[field.name] + ' 占位元素，这个字段不传';
+  }
+  return '当前调用方式不支持这个字段';
+}
+
+function renderField(role, field) {
+  const editable = isEditable(role, field);
+  const value = role.values[field.name];
+  const label = FIELD_LABEL[field.name] ?? field.name;
+  const hints = [];
+  let control;
+  if (editable) {
+    control = renderControl(role, field, value, true);
+    if (field.default !== null && field.default !== undefined) hints.push('默认值 ' + esc(showValue(field.default)));
+    if (field.required) hints.push('必填');
+    if (field.nullable) hints.push('留空表示由调用端决定');
+  } else if (field.state === 'unknown') {
+    control = '<div class="fixed mono">' + esc(showValue(value)) + '</div>';
+    hints.push('<span class="tag">能力未确认，当前值不可编辑</span>');
+  } else {
+    control = renderControl(role, field, value, false);
+    hints.push('<span class="tag warn">' + esc(reasonText(role, field)) + '</span>');
+  }
+  const err = role.errors ? role.errors[field.name] : null;
+  if (err) hints.push('<span class="tag warn">' + esc(err) + '</span>');
+  return '<div class="field" data-state="' + esc(editable ? 'supported' : field.state) + '">' +
+    '<label>' + esc(label) + '</label>' + control +
+    (hints.length ? '<div class="fhint">' + hints.join(' · ') + '</div>' : '') + '</div>';
+}
+
+function renderRoleCard(role) {
+  const unavailable = role.options.filter((o) => o.available === false);
+  const backendField = role.fixedBackend
+    ? '<div class="field"><label>调用方式</label><div class="fixed mono">' + esc(role.backend ?? '—') + '</div>' +
+      '<div class="fhint"><span class="tag">' + esc(fixedHint(role)) + '</span></div></div>'
+    : '<div class="field"><label>调用方式</label><select data-r="' + esc(role.key) + '" data-f="backend">' +
+      role.options.map((o) => '<option value="' + esc(o.id) + '"' + (o.id === role.backend ? ' selected' : '') +
+        (o.available === false ? ' disabled' : '') + '>' + esc(o.label) + '</option>').join('') +
+      '</select><div class="fhint"><span class="tag">' + esc(backendHint(role)) + '</span>' +
+      unavailable.map((o) => '<span class="tag warn">' + esc(o.id + ' 不可用：' + (o.reason ?? '未说明原因')) + '</span>').join('') +
+      '</div></div>';
+  const agentField = role.agent
+    ? '<div class="field"><label>Agent 身份</label><div class="fixed mono">' + esc(role.agent) + '</div>' +
+      '<div class="fhint"><span class="tag">固定身份，不可更改</span></div></div>'
+    : '';
+  return '<div class="role-card" data-role="' + esc(role.key) + '">' +
+    '<div class="rc-head"><span class="dot" style="background:' + colorOf(role.key) + '"></span>' +
+    '<b style="font-size:13px">' + esc(role.label) + '</b>' +
+    '<span class="rc-kind">' + esc(role.kind) + '</span></div>' +
+    (role.note ? '<div class="rc-note">' + esc(role.note) + '</div>' : '') +
+    backendField + agentField +
+    role.fields.map((f) => renderField(role, f)).join('') +
+    '<div class="rc-foot">' + roleFoot(role).map((l) => '<div>' + l + '</div>').join('') + '</div>' +
+    '</div>';
+}
+
+function renderConfigForm() {
+  const roles = cfgState.model ? Object.values(cfgState.model.roles) : [];
+  if (!roles.length) {
+    $('roles-form').innerHTML = '<div class="empty-state"><div class="big">没有可渲染的角色</div>' +
+      '<div>服务端没有返回角色能力描述（capabilities），无法按能力渲染配置表单。</div></div>';
+    return;
+  }
+  $('roles-form').innerHTML = roles.map(renderRoleCard).join('');
+}
+
+function renderAlerts(alerts) {
   const fields = [
     ['overmindCallsPerSession', '单会话 Overmind 次数上限'],
     ['coderCallsPerSession', '单会话 Coder 次数上限'],
@@ -578,7 +797,7 @@ function renderConfig(cfg) {
   ];
   $('alerts-form').innerHTML = fields.map(([k, label]) =>
     '<div class="field"><label>' + esc(label) + '</label>' +
-    '<input class="mono" data-a="' + esc(k) + '" value="' + esc(a[k] ?? '') + '" /></div>').join('');
+    '<input class="mono" data-a="' + esc(k) + '" value="' + esc(alerts?.[k] ?? '') + '" /></div>').join('');
 }
 
 /* ── 数据加载 ── */
@@ -615,10 +834,37 @@ async function load(query) {
 
 async function loadConfig() {
   const res = await fetch('/api/config');
-  const cfg = await res.json();
-  if (cfg.error) throw new Error(cfg.error);
-  state.cfg = cfg;
-  renderConfig(cfg);
+  const payload = await res.json();
+  if (payload?.ok === false || payload?.error) throw new Error(errorText(payload));
+  cfgState.model = buildConfigModel(payload);
+  cfgState.baseline = clone(cfgState.model.config.roles ?? {});
+  cfgState.alerts = clone(cfgState.model.config.alerts ?? {});
+  renderConfigForm();
+  renderAlerts(cfgState.alerts);
+  const banner = $('cap-banner');
+  if (banner) {
+    const cap = cfgState.model.capabilities ?? {};
+    if (cap.ok === false) {
+      banner.innerHTML = '<div class="fhint"><span class="tag warn">' + esc(cap.code ?? '能力不可用') + '</span> ' +
+        esc(cap.message ?? '') +
+        (cap.nextStep && cap.nextStep.text ? ' · 修复动作：' + esc(cap.nextStep.text) : '') + '</div>';
+    } else if (!Object.keys(cap.roles ?? {}).length) {
+      banner.innerHTML = '<div class="fhint"><span class="tag warn">服务端没有返回角色能力描述（capabilities），'
+        + '这里只读展示角色信息，字段不可编辑</span></div>';
+    } else if (!Object.keys(cfgState.model.roles).length) {
+      banner.innerHTML = '<div class="fhint"><span class="tag warn">服务端没有返回角色配置，配置表单不可用</span></div>';
+    } else {
+      banner.innerHTML = '';
+    }
+  }
+}
+
+function errorText(payload) {
+  const err = payload?.error;
+  if (!err) return '未知错误';
+  if (typeof err === 'string') return err;
+  const fields = (err.fields ?? []).map((f) => f.path + ': ' + f.message).join('；');
+  return [err.code ?? 'ERROR', fields].filter(Boolean).join(' ');
 }
 
 /* ── 交互 ── */
@@ -639,26 +885,107 @@ document.addEventListener('click', async (event) => {
   if (tab.id === 't-config') { try { await loadConfig(); } catch (e) { setStatus('读配置失败：' + e.message, 'error'); } }
 });
 
-$('save').addEventListener('click', async () => {
+/* 配置表单的值变化：先记进模型，保存时才发出去。 */
+document.addEventListener('change', (event) => {
+  const el = event.target;
+  if (!el || !el.dataset || !el.dataset.r) return;
+  const role = cfgState.model?.roles?.[el.dataset.r];
+  if (!role) return;
+  const name = el.dataset.f;
+  if (name === 'backend') { switchBackend(role, el.value); renderConfigForm(); return; }
+  const field = role.fields.find((f) => f.name === name);
+  if (!field) return;
+  if (name === 'args') {
+    try {
+      const parsed = JSON.parse(el.value || '[]');
+      if (!Array.isArray(parsed)) throw new Error('必须是 JSON 数组');
+      role.values.args = parsed.map((x) => String(x));
+      role.errors.args = null;
+    } catch (e) {
+      role.errors.args = '参数数组不是合法 JSON 数组：' + e.message;
+    }
+    renderConfigForm();   // 占位元素变了，模型/档位的可写性跟着变
+    return;
+  }
+  if (!isEditable(role, field)) return;
+  const raw = String(el.value ?? '').trim();
+  role.values[name] = raw === '' ? (field.nullable ? null : '') : raw;
+  role.errors[name] = null;
+});
+
+/** 切换调用方式：字段按目标后端重算，旧后端专属值不回填。 */
+function switchBackend(role, backendId) {
+  role.backend = backendId;
+  role.spec = role.backends[backendId] ?? null;
+  role.fields = buildFields(role);
+  role.errors = {};
+  const prev = role.values;
+  const next = {};
+  for (const f of role.fields) {
+    const old = prev[f.name];
+    const carry = f.state === 'supported' && old !== undefined && old !== null && old !== '';
+    next[f.name] = carry ? old : freshValue(f);
+  }
+  role.values = next;
+}
+
+/** 只发已改的可写字段：没动过的角色一个字段都不带。 */
+function buildPatch() {
   const roles = {};
-  for (const el of document.querySelectorAll('#roles-form [data-r]')) {
-    const r = roles[el.dataset.r] ?? (roles[el.dataset.r] = {});
-    r[el.dataset.f] = el.value.trim();
+  const touched = [];
+  let count = 0;
+  for (const role of Object.values(cfgState.model?.roles ?? {})) {
+    const bad = Object.entries(role.errors ?? {}).filter(([, v]) => v).map(([k]) => k);
+    if (bad.length) { touched.push(role.label + '：' + bad.join('、')); continue; }
+    const base = cfgState.baseline?.[role.key] ?? {};
+    const patch = {};
+    if ((role.backend ?? null) !== (base.backend ?? null)) patch.backend = role.backend;
+    // 必填字段留空：本地拦下来。发空串或 null 给服务端只会被判无效，
+    // 提示用户补上比让服务端报错更省事。
+    const emptyRequired = [];
+    for (const f of role.fields) {
+      if (!isEditable(role, f)) continue;
+      const val = role.values[f.name];
+      const empty = val === null || val === undefined || (typeof val === 'string' && val.trim() === '');
+      if (empty && (f.required || !f.nullable)) { emptyRequired.push(f.name); continue; }
+      const before = f.type === 'string[]' ? (base[f.name] ?? []) : (base[f.name] ?? null);
+      if (!sameValue(val, before)) patch[f.name] = val;
+    }
+    if (emptyRequired.length) {
+      touched.push(role.label + '：' + emptyRequired.join('、') + '（必填，不能留空）');
+      continue;
+    }
+    if (Object.keys(patch).length) { roles[role.key] = patch; count += Object.keys(patch).length; }
   }
   const alerts = {};
+  const baseAlerts = cfgState.alerts ?? {};
   for (const el of document.querySelectorAll('#alerts-form [data-a]')) {
     const v = parseFloat(el.value);
-    if (!Number.isNaN(v)) alerts[el.dataset.a] = v;
+    if (Number.isNaN(v)) continue;
+    if (v !== (baseAlerts[el.dataset.a] ?? null)) alerts[el.dataset.a] = v;
   }
+  return { roles: roles, alerts: alerts, count: count, touched: touched };
+}
+
+$('save').addEventListener('click', async () => {
+  const patch = buildPatch();
+  if (patch.touched.length) {
+    setStatus('有字段没通过本地校验，未提交：' + patch.touched.join('；'), 'error');
+    return;
+  }
+  if (!patch.count) { setStatus('没有改动需要保存', 'ok'); return; }
+  let data;
   try {
     const res = await fetch('/api/config', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ roles, alerts }),
+      body: JSON.stringify({ roles: patch.roles, alerts: patch.alerts }),
     });
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    setStatus('已写入 team.json，下次调用生效', 'ok');
-  } catch (e) { setStatus('保存失败：' + e.message, 'error'); }
+    data = await res.json();
+    if (data?.ok === false || data?.error) throw new Error(errorText(data));
+  } catch (e) { setStatus('保存失败：' + e.message, 'error'); return; }
+  const names = Object.keys(patch.roles).map((k) => cfgState.model?.roles?.[k]?.label ?? k);
+  try { await loadConfig(); } catch { /* 保存已成功，只是没刷新回来 */ }
+  setStatus('已保存 ' + patch.count + ' 项改动，从下一次 ' + names.join(' / ') + ' 调用开始生效', 'ok');
 });
 
 $('export').addEventListener('click', () => { window.location.href = '/api/report'; });

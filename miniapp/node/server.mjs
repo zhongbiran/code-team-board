@@ -4,6 +4,7 @@ import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 // Code Team 插件目录：数据源在这里（事件流与角色配置）。
 // 优先读环境变量 CODE_TEAM_PLUGIN_DIR，这样换机器或换安装位置不用改代码。
@@ -409,11 +410,406 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
+// ── 角色配置 API（契约 2：按角色分权） ─────────────────────────────
+// 决策角色 overmind/coder：可改 backend/model/effort，外部命令另有 executable/args。
+// 执行角色 worker/explore/verifier：只能改 model/effort，backend 与 agent 身份固定。
+// 越权或未知字段 → 403 FORBIDDEN_FIELD；类型/值/必填/能力不符 → 422 INVALID_CONFIG。
+// 先收集并校验整份补丁，再原子写一次：任一错误使本次所有角色与告警改动都不落盘。
+
+const ROLE_KEYS = ['overmind', 'coder', 'worker', 'explore', 'verifier'];
+const DECISION_ROLES = new Set(['overmind', 'coder']);
+const SUPPORTED_BACKENDS = ['codex-cli', 'external-command'];
+const EXEC_BACKEND = 'mcode-agent';
+const ROLE_MODEL_DEFAULT = { overmind: 'gpt-6.2-astra', coder: 'gpt-6.2-sol' };
+const DEFAULT_EFFORT = 'medium';
+// 执行角色的 model/effort 由宿主在派工时决定可用域，这里只公布"可编辑"这一事实。
+const EXEC_FIELDS = {
+  model: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: null },
+  effort: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: null },
+};
+
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const hasNul = (s) => String(s).includes('\u0000');
+const isBlankText = (s) => String(s).trim() === '';
+const fieldError = (path, code, message) => ({ path, code, message });
+
+function sameValue(a, b) {
+  if (a === b) return true;
+  const aNull = a === null || a === undefined;
+  const bNull = b === null || b === undefined;
+  if (aNull || bNull) return aNull && bNull;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => sameValue(v, b[i]));
+  }
+  return false;
+}
+
+/** 执行角色里被固定的字段：提交同样的值等于没改，不算越权。 */
+function fixedValue(role, field) {
+  if (DECISION_ROLES.has(role)) return undefined;
+  if (field === 'backend') return EXEC_BACKEND;
+  if (field === 'agent') return role;
+  return undefined;
+}
+
+let decisionBackendCache = null;
+
+/** 加载核心插件的后端能力描述。缺文件/版本过旧就是降级，不崩。 */
+function loadDecisionBackend() {
+  if (!decisionBackendCache) {
+    const file = join(PLUGIN_DIR, 'scripts', 'decision-backend.mjs');
+    decisionBackendCache = import(pathToFileURL(file).href)
+      .then((mod) => {
+        if (typeof mod.describe !== 'function') throw new Error('没有导出 describe');
+        return { ok: true, describe: mod.describe };
+      })
+      .catch((error) => ({ ok: false, error }));
+  }
+  return decisionBackendCache;
+}
+
+function normalizeFields(fields) {
+  const out = {};
+  for (const [name, raw] of Object.entries(fields ?? {})) {
+    out[name] = {
+      type: raw?.type ?? 'string',
+      state: raw?.state ?? 'unknown',
+      nullable: raw?.nullable ?? false,
+      required: raw?.required ?? false,
+      default: raw?.default ?? null,
+      values: Array.isArray(raw?.values) ? raw.values : null,
+    };
+  }
+  return out;
+}
+
+/** 读一次 describe：成功返回契约 1 的形状，失败返回可操作的错误信息。 */
+async function describeBackend(role, roleConfig, teamConfig) {
+  const backend = await loadDecisionBackend();
+  if (!backend.ok) {
+    return {
+      ok: false,
+      message: '核心插件缺少 scripts/decision-backend.mjs（版本过旧），读不到 '
+        + role + ' 的后端能力：' + (backend.error?.message ?? backend.error),
+    };
+  }
+  try {
+    const shape = await backend.describe(role, roleConfig, {
+      config: teamConfig ?? null,
+      cwd: process.cwd(),
+      env: process.env,
+      pluginDir: PLUGIN_DIR,
+    });
+    if (!isPlainObject(shape) || !isPlainObject(shape.fields)) {
+      throw new Error('describe 返回的不是契约形状');
+    }
+    return {
+      ok: true,
+      shape: {
+        id: shape.id ?? roleConfig.backend,
+        fields: normalizeFields(shape.fields),
+        resume: shape.resume ?? 'none',
+        output: shape.output ?? 'text',
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: 'describe(' + role + ', ' + roleConfig.backend + ') 失败：' + (error?.message ?? error),
+    };
+  }
+}
+
+/** GET 的 capabilities：每个角色给可选后端与每个后端的字段能力。 */
+async function buildCapabilities(config) {
+  const roles = {};
+  let degraded = null;
+  for (const role of ROLE_KEYS) {
+    const roleConfig = isPlainObject(config?.roles?.[role]) ? config.roles[role] : {};
+    if (!DECISION_ROLES.has(role)) {
+      roles[role] = {
+        backendOptions: [{ id: EXEC_BACKEND, label: 'MCode 子代理', available: true, reason: null }],
+        backends: {
+          [EXEC_BACKEND]: { id: EXEC_BACKEND, fields: EXEC_FIELDS, resume: 'none', output: 'text' },
+        },
+      };
+      continue;
+    }
+    const backends = {};
+    const backendOptions = [];
+    for (const backend of SUPPORTED_BACKENDS) {
+      const described = await describeBackend(role, { ...roleConfig, backend }, config);
+      if (described.ok) {
+        backends[backend] = described.shape;
+        backendOptions.push({ id: backend, label: backend, available: true, reason: null });
+      } else {
+        backends[backend] = { id: backend, fields: {}, resume: 'none', output: 'text' };
+        backendOptions.push({ id: backend, label: backend, available: false, reason: described.message });
+        degraded ??= { code: 'BACKEND_CAPABILITY_UNAVAILABLE', message: described.message };
+      }
+    }
+    const current = roleConfig.backend;
+    if (current && !SUPPORTED_BACKENDS.includes(current)) {
+      // 历史后端：值保留，但标记不可用，用户可显式改选支持的后端。
+      backendOptions.push({
+        id: current,
+        label: current,
+        available: false,
+        reason: '历史后端 ' + current + ' 已不在支持范围，请显式改选 ' + SUPPORTED_BACKENDS.join(' 或 '),
+      });
+    }
+    roles[role] = { backendOptions, backends };
+  }
+  return {
+    ok: degraded === null,
+    ...(degraded
+      ? {
+          ...degraded,
+          nextStep: {
+            text: '升级 Code Team 插件（安装 scripts/decision-backend.mjs）后重新打开控制台',
+            command: null,
+          },
+        }
+      : {}),
+    roles,
+  };
+}
+
+/**
+ * 校验整份补丁并算出合并后的配置。
+ * 返回 { forbidden, invalid, config }：有 forbidden 就是 403，有 invalid 就是 422，两者都不为空也只写一次。
+ */
+async function planConfigUpdate(current, patch) {
+  const forbidden = [];
+  const invalid = [];
+  const planned = [];
+
+  for (const [role, incoming] of Object.entries(patch.roles ?? {})) {
+    if (!ROLE_KEYS.includes(role)) {
+      forbidden.push(fieldError('roles.' + role, 'FORBIDDEN_FIELD', '未知角色 ' + role));
+      continue;
+    }
+    if (!isPlainObject(incoming)) {
+      invalid.push(fieldError('roles.' + role, 'INVALID_TYPE', '角色配置必须是对象'));
+      continue;
+    }
+    const roleConfig = isPlainObject(current.roles?.[role]) ? current.roles[role] : {};
+    const writable = DECISION_ROLES.has(role)
+      ? new Set(['backend', 'model', 'effort', 'executable', 'args'])
+      : new Set(['model', 'effort']);
+    const changes = {};
+    for (const [field, value] of Object.entries(incoming)) {
+      // 没改的值直接忽略：旧客户端会把只读字段原样回传。
+      if (sameValue(value, roleConfig[field] ?? fixedValue(role, field))) continue;
+      if (!writable.has(field)) {
+        forbidden.push(fieldError(
+          'roles.' + role + '.' + field,
+          'FORBIDDEN_FIELD',
+          role + ' 的 ' + field + ' 只读或未知，不能修改',
+        ));
+        continue;
+      }
+      changes[field] = value;
+    }
+    if (Object.keys(changes).length) planned.push({ role, roleConfig, changes });
+  }
+
+  const mergedRoles = {};
+
+  for (const { role, roleConfig, changes } of planned) {
+    if (!DECISION_ROLES.has(role)) {
+      // 执行角色：只有 model/effort，值要么 null（派工省略）要么非空字符串。
+      for (const [field, value] of Object.entries(changes)) {
+        const path = 'roles.' + role + '.' + field;
+        if (value === null) continue;
+        if (typeof value !== 'string') {
+          invalid.push(fieldError(path, 'INVALID_TYPE', field + ' 必须是字符串'));
+          continue;
+        }
+        if (isBlankText(value)) {
+          invalid.push(fieldError(path, 'INVALID_VALUE', field + ' 不能是空白串'));
+          continue;
+        }
+        if (hasNul(value)) {
+          invalid.push(fieldError(path, 'INVALID_VALUE', field + ' 不能含 NUL'));
+          continue;
+        }
+      }
+      mergedRoles[role] = { ...roleConfig, ...changes };
+      continue;
+    }
+
+    if ('backend' in changes && !SUPPORTED_BACKENDS.includes(changes.backend)) {
+      invalid.push(fieldError(
+        'roles.' + role + '.backend',
+        'INVALID_VALUE',
+        'backend 只能是 ' + SUPPORTED_BACKENDS.join(' 或 '),
+      ));
+      continue;
+    }
+    const targetBackend = 'backend' in changes ? changes.backend : roleConfig.backend;
+    if (!SUPPORTED_BACKENDS.includes(targetBackend)) {
+      // 历史后端：调用参数无法判定，只能先改选后端。
+      for (const field of Object.keys(changes)) {
+        if (field === 'backend') continue;
+        invalid.push(fieldError(
+          'roles.' + role + '.' + field,
+          'UNSUPPORTED',
+          '当前后端 ' + targetBackend + ' 不再支持 ' + field + '，请先改选 ' + SUPPORTED_BACKENDS.join(' 或 '),
+        ));
+      }
+      continue;
+    }
+
+    // 按目标后端重算调用字段：旧后端专属字段清掉，缺省按契约填。
+    const switching = targetBackend !== roleConfig.backend;
+    const merged = { ...roleConfig, backend: targetBackend };
+    if (targetBackend === 'codex-cli') {
+      merged.model = 'model' in changes
+        ? changes.model
+        : (switching ? ROLE_MODEL_DEFAULT[role] : (roleConfig.model ?? ROLE_MODEL_DEFAULT[role] ?? null));
+      merged.effort = 'effort' in changes
+        ? changes.effort
+        : (switching ? DEFAULT_EFFORT : (roleConfig.effort ?? DEFAULT_EFFORT));
+      delete merged.executable;
+      delete merged.args;
+    } else {
+      merged.args = 'args' in changes
+        ? changes.args
+        : (switching ? [] : (roleConfig.args ?? []));
+      const hasModel = Array.isArray(merged.args) && merged.args.includes('{model}');
+      const hasEffort = Array.isArray(merged.args) && merged.args.includes('{effort}');
+      merged.model = 'model' in changes
+        ? changes.model
+        : (switching ? null : (hasModel ? (roleConfig.model ?? null) : null));
+      merged.effort = 'effort' in changes
+        ? changes.effort
+        : (switching ? null : (hasEffort ? (roleConfig.effort ?? null) : null));
+      if ('executable' in changes) merged.executable = changes.executable;
+      else if (!switching) merged.executable = roleConfig.executable;
+      else delete merged.executable;
+    }
+
+    // 能力按合并后的角色来读：档位域要跟着新模型走。
+    const described = await describeBackend(role, merged, current);
+    const fields = described.ok ? described.shape.fields : {};
+
+    for (const [field, value] of Object.entries(changes)) {
+      if (field === 'backend') continue;
+      const path = 'roles.' + role + '.' + field;
+      const spec = fields[field];
+      const supported = targetBackend === 'codex-cli'
+        ? ['model', 'effort']
+        : ['executable', 'args', 'model', 'effort'];
+      if (!supported.includes(field)) {
+        invalid.push(fieldError(path, 'UNSUPPORTED', '后端 ' + targetBackend + ' 不支持 ' + field));
+        continue;
+      }
+      if (spec && spec.state === 'unsupported') {
+        invalid.push(fieldError(path, 'UNSUPPORTED', '后端 ' + targetBackend + ' 不支持 ' + field));
+        continue;
+      }
+      if (targetBackend === 'external-command' && (field === 'model' || field === 'effort')) {
+        const placeholder = field === 'model' ? '{model}' : '{effort}';
+        if (!Array.isArray(merged.args) || !merged.args.includes(placeholder)) {
+          invalid.push(fieldError(
+            path,
+            'UNSUPPORTED',
+            'args 里没有 ' + placeholder + ' 占位元素，' + field + ' 不被支持',
+          ));
+          continue;
+        }
+      }
+      if (field === 'args') {
+        if (!Array.isArray(value)) {
+          invalid.push(fieldError(path, 'INVALID_TYPE', 'args 必须是字符串数组'));
+          continue;
+        }
+        const badType = value.findIndex((v) => typeof v !== 'string');
+        if (badType >= 0) {
+          invalid.push(fieldError(path, 'INVALID_TYPE', 'args[' + badType + '] 必须是字符串'));
+          continue;
+        }
+        const badNul = value.findIndex((v) => hasNul(v));
+        if (badNul >= 0) {
+          invalid.push(fieldError(path, 'INVALID_VALUE', 'args[' + badNul + '] 不能含 NUL'));
+          continue;
+        }
+        continue;
+      }
+      if (value === null || value === undefined) {
+        if (field === 'executable') {
+          invalid.push(fieldError(path, 'REQUIRED', 'external-command 必须给 executable'));
+          continue;
+        }
+        if (targetBackend === 'codex-cli') {
+          invalid.push(fieldError(path, 'INVALID_VALUE', 'codex-cli 的 ' + field + ' 不接受 null'));
+          continue;
+        }
+        continue;
+      }
+      if (typeof value !== 'string') {
+        invalid.push(fieldError(path, 'INVALID_TYPE', field + ' 必须是字符串'));
+        continue;
+      }
+      if (isBlankText(value)) {
+        invalid.push(fieldError(path, 'INVALID_VALUE', field + ' 不能是空白串'));
+        continue;
+      }
+      if (hasNul(value)) {
+        invalid.push(fieldError(path, 'INVALID_VALUE', field + ' 不能含 NUL'));
+        continue;
+      }
+      if (field === 'executable' && /\.(cmd|bat)$/i.test(value)) {
+        invalid.push(fieldError(path, 'UNSUPPORTED', 'Windows 的 .cmd/.bat 不在支持域'));
+        continue;
+      }
+      if ((field === 'model' || field === 'effort') && !(described.ok && spec && spec.state === 'supported')) {
+        invalid.push(fieldError(
+          path,
+          'CAPABILITY_UNKNOWN',
+          '读不到 ' + field + ' 的取值范围（核心插件缺少后端能力描述），无法确认新值',
+        ));
+        continue;
+      }
+      if (spec && Array.isArray(spec.values) && !spec.values.includes(value)) {
+        invalid.push(fieldError(path, 'INVALID_VALUE', field + ' 不在支持的值域内'));
+        continue;
+      }
+    }
+
+    if (targetBackend === 'external-command' && !merged.executable
+      && (switching || 'executable' in changes)) {
+      invalid.push(fieldError('roles.' + role + '.executable', 'REQUIRED', 'external-command 必须给 executable'));
+    }
+
+    mergedRoles[role] = merged;
+  }
+
+  const config = { ...current, roles: { ...(current.roles ?? {}) } };
+  for (const [role, merged] of Object.entries(mergedRoles)) config.roles[role] = merged;
+
+  if (patch.alerts) {
+    for (const [key, value] of Object.entries(patch.alerts)) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        invalid.push(fieldError('alerts.' + key, 'INVALID_TYPE', '告警阈值必须是数字'));
+      }
+    }
+    config.alerts = { ...(current.alerts ?? {}), ...patch.alerts };
+  }
+
+  return { forbidden, invalid, config };
+}
+
+function fail(response, status, code, fields) {
+  json(response, { ok: false, error: { code, fields } }, status);
+}
+
 export async function start(context) {
   const clientEntry = await readFile(join(context.pluginRoot, 'miniapp/client/index.html'));
   const cfg = readJson(TEAM_CONFIG, {});
 
-  const server = createServer((request, response) => {
+  const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://miniapp.local');
     const path = url.pathname;
 
@@ -430,9 +826,18 @@ export async function start(context) {
     }
 
     if (request.method === 'GET' && path === '/api/config') {
-      const c = readJson(TEAM_CONFIG, null);
-      if (!c) { json(response, { error: '读不到 team.json' }, 500); return; }
-      json(response, c);
+      const current = readJson(TEAM_CONFIG, null);
+      if (!current) {
+        fail(response, 500, 'CONFIG_IO', [{ path: '', code: 'CONFIG_IO', message: '读不到 team.json' }]);
+        return;
+      }
+      try {
+        json(response, { ok: true, config: current, capabilities: await buildCapabilities(current) });
+      } catch (error) {
+        fail(response, 500, 'CONFIG_IO', [
+          { path: '', code: 'CONFIG_IO', message: String(error?.message ?? error) },
+        ]);
+      }
       return;
     }
 
@@ -440,30 +845,58 @@ export async function start(context) {
       let body = '';
       request.on('data', (chunk) => { body += chunk; });
       request.on('end', async () => {
+        let patch;
         try {
-          const patch = JSON.parse(body || '{}');
-          const current = readJson(TEAM_CONFIG, {});
-          const merged = { ...current, roles: { ...(current.roles ?? {}) } };
-          for (const [key, incoming] of Object.entries(patch.roles ?? {})) {
-            if (!incoming || typeof incoming !== 'object') continue;
-            const role = { ...(merged.roles[key] ?? {}) };
-            for (const field of ['backend', 'model', 'effort', 'agent']) {
-              if (field === 'effort') {
-                if (incoming[field] === null || incoming[field] === '') role[field] = null;
-                else if (typeof incoming[field] === 'string') role[field] = incoming[field];
-              } else if (typeof incoming[field] === 'string') {
-                role[field] = incoming[field];
-              }
-            }
-            merged.roles[key] = role;
+          patch = body ? JSON.parse(body) : {};
+        } catch {
+          fail(response, 400, 'INVALID_BODY', [
+            { path: '', code: 'INVALID_BODY', message: '请求体不是合法 JSON' },
+          ]);
+          return;
+        }
+        if (!isPlainObject(patch)) {
+          fail(response, 400, 'INVALID_BODY', [
+            { path: '', code: 'INVALID_BODY', message: '请求体必须是对象' },
+          ]);
+          return;
+        }
+        if ('roles' in patch && !isPlainObject(patch.roles)) {
+          fail(response, 400, 'INVALID_BODY', [
+            { path: 'roles', code: 'INVALID_BODY', message: 'roles 必须是对象' },
+          ]);
+          return;
+        }
+        if ('alerts' in patch && !isPlainObject(patch.alerts)) {
+          fail(response, 400, 'INVALID_BODY', [
+            { path: 'alerts', code: 'INVALID_BODY', message: 'alerts 必须是对象' },
+          ]);
+          return;
+        }
+        try {
+          const current = readJson(TEAM_CONFIG, null);
+          if (!current) {
+            fail(response, 500, 'CONFIG_IO', [{ path: '', code: 'CONFIG_IO', message: '读不到 team.json' }]);
+            return;
           }
-          if (patch.alerts && typeof patch.alerts === 'object') {
-            merged.alerts = { ...(current.alerts ?? {}), ...patch.alerts };
+          const plan = await planConfigUpdate(current, patch);
+          if (plan.forbidden.length || plan.invalid.length) {
+            // 越权优先：403 报字段名，422 报字段级原因；两种情况都整次拒绝，不落盘。
+            const forbidden = plan.forbidden.length > 0;
+            const fields = (forbidden ? plan.forbidden : plan.invalid)
+              .map((f) => ({ path: f.path, code: f.code, message: f.message }));
+            fail(response, forbidden ? 403 : 422, forbidden ? 'FORBIDDEN_FIELD' : 'INVALID_CONFIG', fields);
+            return;
           }
-          await writeJsonAtomic(TEAM_CONFIG, merged);
-          json(response, { ok: true, config: merged });
+          await writeJsonAtomic(TEAM_CONFIG, plan.config);
+          json(response, {
+            ok: true,
+            config: plan.config,
+            capabilities: await buildCapabilities(plan.config),
+          });
         } catch (error) {
-          json(response, { error: String(error?.message ?? error) }, 400);
+          fail(response, 500, 'CONFIG_IO', [
+            { path: '', code: 'CONFIG_IO', message: String(error?.message ?? error) },
+          ]);
         }
       });
       return;
