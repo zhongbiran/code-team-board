@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Code Team 控制台</title>
+<style>
+/* ── 设计方向：调度台 ──────────────────────────────
+   母题：一支 agent 团队的调度台 / 飞行仪表。
+   深蓝墨底、细分割线、等宽字体承载一切数字，
+   颜色只用于区分角色与严重度，不做装饰。
+   ───────────────────────────────────────────── */
+:root,
+[data-theme='light'] {
+  --mcode-bg: #f4f6f8;
+  --mcode-surface: #ffffff;
+  --mcode-surface-muted: #eef1f5;
+  --mcode-text: #0e1621;
+  --mcode-text-muted: #4a5a6e;
+  --mcode-text-subtle: #8b9aad;
+  --mcode-border: #d5dde6;
+  --mcode-border-strong: #0e16211f;
+  --r-overmind: #7c6cff;
+  --r-coder: #00b8d9;
+  --r-worker: #ff9f2e;
+  --r-explore: #3ddc97;
+  --r-verifier: #ff5c8a;
+  --mcode-danger: #e5484d;
+  --mcode-warning: #f76808;
+  --mcode-accent: #0090ff;
+  --mcode-success: #12a150;
+}
+[data-theme='dark'] {
+  --mcode-bg: #0b1017;
+  --mcode-surface: #121a24;
+  --mcode-surface-muted: #18212d;
+  --mcode-text: #e6edf5;
+  --mcode-text-muted: #93a4b8;
+  --mcode-text-subtle: #5b6b7e;
+  --mcode-border: #22303f;
+  --mcode-border-strong: #ffffff1a;
+  --r-overmind: #9d8cff;
+  --r-coder: #35d6f2;
+  --r-worker: #ffb454;
+  --r-explore: #5ce8b0;
+  --r-verifier: #ff85ad;
+  --mcode-danger: #ff6369;
+  --mcode-warning: #ff8a3d;
+  --mcode-accent: #4ba3ff;
+  --mcode-success: #3ddc84;
+}
+
+/* 跟随系统偏好：不强制亮/暗，仅在系统明确偏好时切换到暗色变量。 */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --mcode-bg: #0b1017;
+    --mcode-surface: #121a24;
+    --mcode-surface-muted: #18212d;
+    --mcode-text: #e6edf5;
+    --mcode-text-muted: #93a4b8;
+    --mcode-text-subtle: #5b6b7e;
+    --mcode-border: #22303f;
+    --mcode-border-strong: #ffffff1a;
+    --r-overmind: #9d8cff;
+    --r-coder: #35d6f2;
+    --r-worker: #ffb454;
+    --r-explore: #5ce8b0;
+    --r-verifier: #ff85ad;
+    --mcode-danger: #ff6369;
+    --mcode-warning: #ff8a3d;
+    --mcode-accent: #4ba3ff;
+    --mcode-success: #3ddc84;
+  }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: var(--mcode-bg);
+  color: var(--mcode-text);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono, .num, code {
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, 'Liberation Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 顶栏 ───────────────────────────── */
+.topbar {
+  display: flex; align-items: center; gap: 20px;
+  padding: 0 24px; height: 56px;
+  background: var(--mcode-surface);
+  border-bottom: 1px solid var(--mcode-border);
+  position: sticky; top: 0; z-index: 20;
+}
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand b { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.brand span { font-size: 11px; color: var(--mcode-text-subtle); letter-spacing: 0.08em; text-transform: uppercase; }
+
+.tabs { display: flex; gap: 2px; margin-left: 4px; }
+.tabs button {
+  font: inherit; font-size: 13px; padding: 7px 13px;
+  border: 1px solid transparent; border-radius: 7px;
+  background: transparent; color: var(--mcode-text-muted); cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.tabs button:hover { color: var(--mcode-text); background: var(--mcode-surface-muted); }
+.tabs button[aria-selected='true'] { background: var(--mcode-text); color: var(--mcode-surface); }
+@media (prefers-color-scheme: dark) { .tabs button[aria-selected='true'] { background: var(--mcode-text); color: var(--mcode-bg); } }
+
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+.clock { font-size: 12px; color: var(--mcode-text-subtle); }
+
+/* ── 主体 ───────────────────────────── */
+main { padding: 20px 24px 48px; max-width: 1480px; }
+.view[hidden] { display: none; }
+
+/* ── 读数条：仪表盘而非卡片 ─────────── */
+.readout {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  background: var(--mcode-surface);
+  border: 1px solid var(--mcode-border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.readout > div {
+  padding: 14px 18px;
+  border-right: 1px solid var(--mcode-border);
+}
+.readout > div:last-child { border-right: none; }
+.readout .k { font-size: 11px; color: var(--mcode-text-subtle); letter-spacing: 0.04em; }
+.readout .v { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; margin-top: 3px; }
+.readout .s { font-size: 11px; color: var(--mcode-text-subtle); margin-top: 1px; }
+
+/* ── 面板 ───────────────────────────── */
+.panel {
+  background: var(--mcode-surface);
+  border: 1px solid var(--mcode-border);
+  border-radius: 12px;
+  margin-top: 16px;
+  overflow: hidden;
+}
+.panel > header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--mcode-border);
+  background: var(--mcode-surface);
+}
+.panel > header h2 { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+.panel > header .hint { font-size: 11px; color: var(--mcode-text-subtle); }
+.panel > header .spacer { margin-left: auto; }
+.panel .body { padding: 14px 16px; }
+
+/* ── 问题诊断 ───────────────────────── */
+.findings { display: flex; flex-direction: column; gap: 8px; }
+.finding {
+  display: grid; grid-template-columns: 4px 1fr; gap: 0;
+  border: 1px solid var(--mcode-border); border-radius: 9px; overflow: hidden;
+  background: var(--mcode-surface);
+}
+.finding .stripe { background: var(--mcode-accent); }
+.finding[data-sev='danger'] .stripe { background: var(--mcode-danger); }
+.finding[data-sev='warning'] .stripe { background: var(--mcode-warning); }
+.finding .inner { padding: 11px 14px; }
+.finding .head { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
+.finding .sev {
+  font-size: 10px; font-weight: 600; letter-spacing: .06em;
+  padding: 1px 6px; border-radius: 4px; text-transform: uppercase;
+}
+.finding[data-sev='danger'] .sev { background: var(--mcode-danger); color: #fff; }
+.finding[data-sev='warning'] .sev { background: var(--mcode-warning); color: #fff; }
+.finding[data-sev='info'] .sev { background: var(--mcode-accent); color: #fff; }
+.finding .title { font-size: 13px; font-weight: 600; }
+.finding .where { font-size: 11px; color: var(--mcode-text-subtle); margin-left: auto; }
+.finding .detail { font-size: 12px; color: var(--mcode-text-muted); margin-top: 6px; }
+.finding .evidence { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.ev {
+  font-size: 11px; padding: 2px 7px; border-radius: 5px;
+  background: var(--mcode-surface-muted); color: var(--mcode-text-muted); border: 1px solid var(--mcode-border);
+}
+.empty-state { text-align: center; padding: 36px 20px; color: var(--mcode-text-subtle); }
+.empty-state .big { font-size: 15px; color: var(--mcode-text-muted); margin-bottom: 4px; }
+
+/* ── 检索 ───────────────────────────── */
+.search {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--mcode-surface-muted); border: 1px solid var(--mcode-border);
+  border-radius: 8px; padding: 0 10px;
+}
+.search input {
+  font: inherit; font-size: 13px; flex: 1;
+  border: none; background: transparent; color: var(--mcode-text);
+  padding: 8px 0; outline: none;
+}
+.search .icon { color: var(--mcode-text-subtle); font-size: 13px; }
+.search kbd {
+  font-size: 10px; padding: 1px 5px; border-radius: 4px;
+  background: var(--mcode-surface); border: 1px solid var(--mcode-border); color: var(--mcode-text-subtle);
+}
+
+/* ── 三级树：项目 → 会话 → 角色 ─────── */
+.tree { display: flex; flex-direction: column; gap: 3px; }
+.project {
+  border: 1px solid var(--mcode-border); border-radius: 9px; background: var(--mcode-surface);
+  margin-bottom: 7px; overflow: hidden;
+}
+.project > .proj-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 13px; cursor: pointer; user-select: none;
+  background: var(--mcode-surface);
+}
+.project > .proj-head:hover { background: var(--mcode-surface-muted); }
+.project .caret { color: var(--mcode-text-subtle); font-size: 10px; width: 10px; transition: transform .15s; }
+.project[data-open='true'] .caret { transform: rotate(90deg); }
+.project .pname { font-weight: 600; font-size: 13px; }
+.project .pmeta { font-size: 11px; color: var(--mcode-text-subtle); margin-left: auto; display: flex; gap: 14px; }
+
+.sessions { border-top: 1px solid var(--mcode-border); background: var(--mcode-surface-muted); }
+.session {
+  border-bottom: 1px solid var(--mcode-border);
+}
+.session:last-child { border-bottom: none; }
+.session > .s-head {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 13px 8px 30px; cursor: pointer; user-select: none;
+}
+.session > .s-head:hover { background: var(--mcode-surface); }
+.session .sname { font-size: 12px; color: var(--mcode-text); }
+.session .smeta { font-size: 11px; color: var(--mcode-text-subtle); margin-left: auto; display: flex; gap: 12px; }
+
+.roles { padding: 0 13px 10px 40px; display: flex; flex-direction: column; gap: 5px; }
+.role {
+  display: grid; grid-template-columns: 92px 1fr auto;
+  align-items: center; gap: 12px;
+  padding: 8px 11px;
+  background: var(--mcode-surface); border: 1px solid var(--mcode-border); border-radius: 7px;
+}
+.role .rname { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; }
+.role .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.role .rbar { height: 5px; border-radius: 3px; background: var(--mcode-surface-muted); overflow: hidden; }
+.role .rbar i { display: block; height: 100%; border-radius: 3px; }
+.role .rnum { font-size: 11px; color: var(--mcode-text-muted); display: flex; gap: 11px; }
+.role .rmodels { grid-column: 1 / -1; font-size: 11px; color: var(--mcode-text-subtle); }
+
+/* ── 表格 ───────────────────────────── */
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th {
+  text-align: left; font-weight: 500; font-size: 11px; color: var(--mcode-text-subtle);
+  padding: 7px 9px; border-bottom: 1px solid var(--mcode-border); background: var(--mcode-surface-muted);
+  position: sticky; top: 56px;
+}
+td { padding: 7px 9px; border-bottom: 1px solid var(--mcode-border); }
+tr:last-child td { border-bottom: none; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.dim { color: var(--mcode-text-subtle); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+.grid2 > .panel { margin-top: 16px; }
+
+/* ── 表单 ───────────────────────────── */
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+.role-card {
+  border: 1px solid var(--mcode-border); border-radius: 10px; padding: 15px;
+  background: var(--mcode-surface);
+}
+.role-card .rc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
+.role-card .rc-head .dot { width: 8px; height: 8px; border-radius: 50%; }
+.role-card .rc-kind { font-size: 10px; color: var(--mcode-text-subtle); margin-left: auto; text-transform: uppercase; letter-spacing: .05em; }
+.role-card .rc-note { font-size: 11px; color: var(--mcode-text-subtle); margin-bottom: 12px; }
+.field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 11px; }
+.field label { font-size: 11px; color: var(--mcode-text-muted); }
+.field input, .field select {
+  font: inherit; font-size: 12.5px; padding: 7px 9px;
+  border: 1px solid var(--mcode-border); border-radius: 6px;
+  background: var(--mcode-surface-muted); color: var(--mcode-text); width: 100%;
+}
+.field input:focus, .field select:focus { outline: 2px solid var(--mcode-accent); outline-offset: -1px; }
+.field input.mono { font-family: 'JetBrains Mono', Consolas, monospace; }
+
+.actions { display: flex; align-items: center; gap: 10px; padding-top: 6px; }
+button.primary {
+  font: inherit; font-size: 13px; font-weight: 500; padding: 8px 15px;
+  border-radius: 7px; border: none; cursor: pointer;
+  background: var(--mcode-text); color: var(--mcode-surface);
+}
+button.ghost {
+  font: inherit; font-size: 13px; padding: 8px 15px;
+  border-radius: 7px; border: 1px solid var(--mcode-border);
+  background: transparent; color: var(--mcode-text); cursor: pointer;
+}
+button.ghost:hover { background: var(--mcode-surface-muted); }
+#status { font-size: 12px; color: var(--mcode-text-muted); }
+#status[data-kind='error'] { color: var(--mcode-danger); }
+#status[data-kind='ok'] { color: var(--mcode-success); }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (max-width: 720px) {
+  .readout { grid-template-columns: repeat(2, 1fr); }
+  .readout > div:nth-child(2n) { border-right: none; }
+  .role { grid-template-columns: 78px 1fr; }
+  .role .rnum { grid-column: 1 / -1; justify-content: flex-end; }
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><b>Code Team</b><span>调度台</span></div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" id="t-findings" aria-selected="true" aria-controls="v-findings">问题诊断</button>
+    <button role="tab" id="t-tree" aria-selected="false" aria-controls="v-tree">统计详情</button>
+    <button role="tab" id="t-config" aria-selected="false" aria-controls="v-config">配置</button>
+  </nav>
+  <div class="topbar-right">
+    <span class="clock mono" id="clock"></span>
+  </div>
+</header>
+
+<main>
+  <!-- 问题诊断 -->
+  <section class="view" id="v-findings" role="tabpanel" aria-labelledby="t-findings">
+    <div class="readout" id="readout"></div>
+
+    <div class="panel">
+      <header>
+        <h2>检测到的问题</h2>
+        <span class="hint" id="findings-hint"></span>
+        <span class="spacer"></span>
+      </header>
+      <div class="body">
+        <div class="search" style="max-width:340px;margin-bottom:12px">
+          <span class="icon">⌕</span>
+          <input id="q1" type="search" placeholder="检索项目 / 会话 / 角色 / 任务" />
+          <button class="ghost" id="q1-search" type="button">检索</button>
+        </div>
+        <div class="findings" id="findings"></div>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="panel">
+        <header><h2>按项目</h2></header>
+        <div class="body" id="d-project"></div>
+      </div>
+      <div class="panel">
+        <header><h2>按角色</h2></header>
+        <div class="body" id="d-role"></div>
+      </div>
+      <div class="panel">
+        <header><h2>按模型</h2></header>
+        <div class="body" id="d-model"></div>
+      </div>
+      <div class="panel">
+        <header><h2>按后端</h2></header>
+        <div class="body" id="d-backend"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 统计详情 -->
+  <section class="view" id="v-tree" role="tabpanel" aria-labelledby="t-tree" hidden>
+    <div class="panel">
+      <header>
+        <h2>项目 → 会话 → 角色</h2>
+        <span class="hint" id="tree-hint"></span>
+        <span class="spacer"></span>
+      </header>
+      <div class="body">
+        <div class="search" style="max-width:360px;margin-bottom:12px">
+          <span class="icon">⌕</span>
+          <input id="q2" type="search" placeholder="检索任意字段" />
+          <button class="ghost" id="q2-search" type="button">检索</button>
+          <kbd id="q2-count"></kbd>
+        </div>
+        <div class="tree" id="tree"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <header><h2>原始事件</h2><span class="hint" id="raw-hint"></span></header>
+      <div class="body" style="padding:0">
+        <div style="max-height:420px;overflow:auto">
+          <table id="raw-table"></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 配置 -->
+  <section class="view" id="v-config" role="tabpanel" aria-labelledby="t-config" hidden>
+    <div class="panel">
+      <header><h2>角色配置</h2><span class="hint">改动写回插件的 config/team.json，下次调用生效</span></header>
+      <div class="body">
+        <div class="form-grid" id="roles-form"></div>
+        <div class="actions">
+          <button class="primary" id="save">保存</button>
+          <button class="ghost" id="export">导出周报 Markdown</button>
+          <span id="status" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <header><h2>告警阈值</h2><span class="hint">诊断规则由这些阈值驱动</span></header>
+      <div class="body">
+        <div class="form-grid" id="alerts-form"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => (n ?? 0).toLocaleString('zh-CN');
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+
+const ROLE_COLOR = {
+  overmind: 'var(--r-overmind)', coder: 'var(--r-coder)', worker: 'var(--r-worker)',
+  explore: 'var(--r-explore)', verifier: 'var(--r-verifier)',
+};
+const colorOf = (role) => ROLE_COLOR[role] ?? 'var(--mcode-text-subtle)';
+
+let state = { data: null, cfg: null, query: '', open: new Set() };
+
+function setStatus(text, kind) {
+  const el = $('status');
+  el.textContent = text;
+  if (kind) el.dataset.kind = kind; else delete el.dataset.kind;
+}
+
+/* ── 读数条 ── */
+function renderReadout(t) {
+  const cells = [
+    { k: '消耗 Token', v: fmt(t.totalTokens), s: '输入 ' + fmt(t.inputTokens) + ' / 输出 ' + fmt(t.outputTokens) },
+    { k: '缓存命中', v: (t.cacheHitRate * 100).toFixed(1) + '%', s: '命中 ' + fmt(t.cachedTokens) },
+    { k: '总耗时', v: t.elapsedSec.toFixed(1) + 's', s: '单次均 ' + t.avgCallSec.toFixed(1) + 's' },
+    { k: '覆盖范围', v: t.projects + ' / ' + t.sessions, s: '项目 / 会话' },
+    { k: '调用 / 派工', v: t.calls + ' / ' + t.dispatches, s: '次数' },
+  ];
+  $('readout').innerHTML = cells.map((c) =>
+    '<div><div class="k">' + esc(c.k) + '</div><div class="v num">' + esc(c.v) + '</div><div class="s">' + esc(c.s) + '</div></div>'
+  ).join('');
+}
+
+/* ── 问题列表 ── */
+function renderFindings(findings, counts) {
+  $('findings-hint').textContent = counts.danger + ' 严重 · ' + counts.warning + ' 注意 · ' + counts.info + ' 提示';
+  if (!findings.length) {
+    $('findings').innerHTML = '<div class="empty-state"><div class="big">没检测到异常</div><div>当前统计范围内，各条诊断规则都通过了。</div></div>';
+    return;
+  }
+  const sevLabel = { danger: '严重', warning: '注意', info: '提示' };
+  $('findings').innerHTML = findings.map((f) => {
+    const ev = (f.evidence || []).map((e) => {
+      const bits = [];
+      if (e.at) bits.push(String(e.at).slice(11, 19));
+      if (e.model) bits.push(e.model);
+      if (e.elapsedSec != null) bits.push(e.elapsedSec + 's');
+      if (e.task) bits.push(e.task);
+      return '<span class="ev">' + esc(bits.join(' · ')) + '</span>';
+    }).join('');
+    return '<div class="finding" data-sev="' + esc(f.severity) + '">' +
+      '<div class="stripe"></div>' +
+      '<div class="inner">' +
+      '<div class="head"><span class="sev">' + esc(sevLabel[f.severity] ?? f.severity) + '</span>' +
+      '<span class="title">' + esc(f.title) + '</span>' +
+      '<span class="where mono">' + esc(f.project) + ' · ' + esc(String(f.sessionId).slice(0, 18)) + '</span></div>' +
+      '<div class="detail">' + esc(f.detail) + '</div>' +
+      (ev ? '<div class="evidence">' + ev + '</div>' : '') +
+      '</div></div>';
+  }).join('');
+}
+
+/* ── 维度表 ── */
+function renderDim(el, rows, keyLabel) {
+  if (!rows.length) { el.innerHTML = '<div class="empty-state"><div>暂无数据</div></div>'; return; }
+  const max = Math.max(...rows.map((r) => r.total || 0), 1);
+  el.innerHTML = '<table><thead><tr><th>' + esc(keyLabel) + '</th><th style="text-align:right">次数</th>' +
+    '<th style="text-align:right">耗时(s)</th><th style="text-align:right">Token</th><th style="width:32%"></th></tr></thead><tbody>' +
+    rows.map((r) => '<tr><td>' + esc(r.label ?? r.key) + '</td>' +
+      '<td class="n">' + fmt(r.count) + '</td>' +
+      '<td class="n">' + (r.elapsedSec ?? 0).toFixed(1) + '</td>' +
+      '<td class="n">' + fmt(r.total) + '</td>' +
+      '<td><div class="rbar"><i style="width:' + Math.round(((r.total || 0) / max) * 100) + '%;background:' +
+        (r.key in ROLE_COLOR ? colorOf(r.key) : 'var(--mcode-accent)') + '"></i></div></td></tr>').join('') +
+    '</tbody></table>';
+}
+
+/* ── 三级树 ── */
+function renderTree(tree) {
+  if (!tree.length) { $('tree').innerHTML = '<div class="empty-state"><div class="big">没有匹配的事件</div><div>换个关键词，或先跑一次 Code Team。</div></div>'; return; }
+  $('tree').innerHTML = tree.map((p) => {
+    const pOpen = state.open.has('p:' + p.project);
+    const sessions = p.sessions.map((s) => {
+      const sOpen = state.open.has('s:' + p.project + '|' + s.session);
+      const maxRole = Math.max(...s.roles.map((r) => r.total || 0), 1);
+      const roles = s.roles.map((r) => {
+        const models = Object.entries(r.models || {}).map(([m, n]) => m + (n > 1 ? ' ×' + n : '')).join(', ');
+        return '<div class="role">' +
+          '<div class="rname"><span class="dot" style="background:' + colorOf(r.role) + '"></span>' + esc(r.label) + '</div>' +
+          '<div class="rbar"><i style="width:' + Math.round(((r.total || 0) / maxRole) * 100) + '%;background:' + colorOf(r.role) + '"></i></div>' +
+          '<div class="rnum"><span>' + r.count + ' 次</span><span>' + (r.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(r.total) + ' tok</span></div>' +
+          '<div class="rmodels mono">' + esc(models) + '</div>' +
+          '</div>';
+      }).join('');
+      return '<div class="session">' +
+        '<div class="s-head" data-p="' + esc(p.project) + '" data-s="' + esc(s.session) + '">' +
+        '<span class="caret">▶</span><span class="sname mono">' + esc(String(s.session).slice(0, 26)) + '</span>' +
+        '<span class="smeta"><span>' + s.count + ' 事件</span><span>' + (s.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(s.total) + ' tok</span></span></div>' +
+        (sOpen ? '<div class="roles">' + roles + '</div>' : '') +
+        '</div>';
+    }).join('');
+    return '<div class="project" data-open="' + pOpen + '">' +
+      '<div class="proj-head" data-p="' + esc(p.project) + '">' +
+      '<span class="caret">▶</span><span class="pname">' + esc(p.project) + '</span>' +
+      '<span class="pmeta"><span>' + p.sessions.length + ' 会话</span><span>' + p.count + ' 事件</span><span>' + (p.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(p.total) + ' tok</span></span></div>' +
+      (pOpen ? '<div class="sessions">' + sessions + '</div>' : '') +
+      '</div>';
+  }).join('');
+}
+
+/* ── 原始事件表 ── */
+function renderRaw(recent) {
+  $('raw-hint').textContent = '最近 ' + recent.length + ' 条';
+  if (!recent.length) { $('raw-table').innerHTML = '<tbody><tr><td class="dim">暂无事件</td></tr></tbody>'; return; }
+  $('raw-table').innerHTML = '<thead><tr><th>时间</th><th>类型</th><th>角色</th><th>模型</th><th>档位</th>' +
+    '<th>项目</th><th>会话</th><th>任务</th><th style="text-align:right">耗时</th><th style="text-align:right">Token</th></tr></thead><tbody>' +
+    recent.map((e) => '<tr>' +
+      '<td class="mono dim">' + esc(String(e.at || '').slice(11, 19)) + '</td>' +
+      '<td class="dim">' + esc(e.kind) + '</td>' +
+      '<td><span class="dot" style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + colorOf(e.role) + ';margin-right:5px"></span>' + esc(e.role) + '</td>' +
+      '<td class="mono">' + esc(e.model) + '</td>' +
+      '<td class="dim">' + esc(e.effort ?? '—') + '</td>' +
+      '<td>' + esc(e.project ?? '—') + '</td>' +
+      '<td class="mono dim">' + esc(String(e.session ?? '—').slice(0, 14)) + '</td>' +
+      '<td>' + esc(e.task ?? '—') + '</td>' +
+      '<td class="n">' + (e.elapsedSec ?? 0) + '</td>' +
+      '<td class="n">' + fmt(e.tokens) + '</td>' +
+      '</tr>').join('') + '</tbody>';
+}
+
+/* ── 配置表单 ── */
+function renderConfig(cfg) {
+  const roles = cfg.roles ?? {};
+  $('roles-form').innerHTML = Object.entries(roles).map(([key, r]) => {
+    const efforts = ['low','medium','high','xhigh','max','ultra'];
+    const isCli = r.backend === 'codex-cli';
+    return '<div class="role-card">' +
+      '<div class="rc-head"><span class="dot" style="background:' + colorOf(key) + '"></span>' +
+      '<b style="font-size:13px">' + esc(r.label ?? key) + '</b>' +
+      '<span class="rc-kind">' + esc(r.kind ?? '') + '</span></div>' +
+      '<div class="rc-note">' + esc(r.note ?? '') + '</div>' +
+      '<div class="field"><label>后端</label>' +
+      '<select data-r="' + esc(key) + '" data-f="backend">' +
+      '<option value="codex-cli"' + (isCli ? ' selected' : '') + '>codex-cli（本机 Codex）</option>' +
+      '<option value="mcode-agent"' + (!isCli ? ' selected' : '') + '>mcode-agent（MCode 子代理）</option>' +
+      '</select></div>' +
+      '<div class="field"><label>模型</label>' +
+      '<input class="mono" data-r="' + esc(key) + '" data-f="model" value="' + esc(r.model ?? '') + '" /></div>' +
+      (isCli
+        ? '<div class="field"><label>思考档位</label><select data-r="' + esc(key) + '" data-f="effort">' +
+          efforts.map((x) => '<option value="' + x + '"' + ((r.effort ?? 'medium') === x ? ' selected' : '') + '>' + x + '</option>').join('') +
+          '</select></div>'
+        : '<div class="field"><label>Agent</label><input class="mono" data-r="' + esc(key) + '" data-f="agent" value="' + esc(r.agent ?? '') + '" /></div>') +
+      '</div>';
+  }).join('');
+
+  const a = cfg.alerts ?? {};
+  const fields = [
+    ['overmindCallsPerSession', '单会话 Overmind 次数上限'],
+    ['coderCallsPerSession', '单会话 Coder 次数上限'],
+    ['minCacheHitRate', '缓存命中率下限（0-1）'],
+    ['slowCallSec', '慢调用阈值（秒）'],
+    ['staleDays', '停滞天数阈值'],
+  ];
+  $('alerts-form').innerHTML = fields.map(([k, label]) =>
+    '<div class="field"><label>' + esc(label) + '</label>' +
+    '<input class="mono" data-a="' + esc(k) + '" value="' + esc(a[k] ?? '') + '" /></div>').join('');
+}
+
+/* ── 数据加载 ── */
+async function load(query) {
+  const res = await fetch('/api/stats' + (query ? '?q=' + encodeURIComponent(query) : ''));
+  if (!res.ok) {
+    // 401 通常意味着运行时重启过、页面凭证失效——明确说出来，别让页面静默停更。
+    throw new Error(res.status === 401
+      ? '会话凭证已失效（运行时可能重启过）。重新打开控制台即可恢复。'
+      : '读取失败：HTTP ' + res.status);
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  state.data = data;
+  // 检索时自动展开：用户搜就是想看细节，不该还要手动点开。
+  if (state.query) {
+    for (const p of data.tree) {
+      state.open.add('p:' + p.project);
+      for (const s of p.sessions) state.open.add('s:' + p.project + '|' + s.session);
+    }
+  }
+  renderReadout(data.totals);
+  renderFindings(data.findings, data.findingCounts);
+  renderDim($('d-project'), data.byProject, '项目');
+  renderDim($('d-role'), data.byRole, '角色');
+  renderDim($('d-model'), data.byModel, '模型');
+  renderDim($('d-backend'), data.byBackend, '后端');
+  renderTree(data.tree);
+  $('q2-count').textContent = state.query ? data.totals.events : '';
+  $('tree-hint').textContent = (state.query ? '命中 ' + data.totals.events + ' 条' : '') +
+    ' · ' + data.tree.length + ' 个项目 / ' + data.tree.reduce((n, p) => n + p.sessions.length, 0) + ' 个会话';
+  renderRaw(data.recent);
+}
+
+async function loadConfig() {
+  const res = await fetch('/api/config');
+  const cfg = await res.json();
+  if (cfg.error) throw new Error(cfg.error);
+  state.cfg = cfg;
+  renderConfig(cfg);
+}
+
+/* ── 交互 ── */
+document.addEventListener('click', async (event) => {
+  const head = event.target.closest('.proj-head, .s-head');
+  if (head) {
+    const p = head.dataset.p;
+    const s = head.dataset.s;
+    const key = s ? 's:' + p + '|' + s : 'p:' + p;
+    if (state.open.has(key)) state.open.delete(key); else state.open.add(key);
+    renderTree(state.data.tree);
+    return;
+  }
+  const tab = event.target.closest('[role="tab"]');
+  if (!tab) return;
+  for (const t of document.querySelectorAll('[role="tab"]')) t.setAttribute('aria-selected', String(t === tab));
+  for (const v of document.querySelectorAll('.view')) v.hidden = v.id !== tab.getAttribute('aria-controls');
+  if (tab.id === 't-config') { try { await loadConfig(); } catch (e) { setStatus('读配置失败：' + e.message, 'error'); } }
+});
+
+$('save').addEventListener('click', async () => {
+  const roles = {};
+  for (const el of document.querySelectorAll('#roles-form [data-r]')) {
+    const r = roles[el.dataset.r] ?? (roles[el.dataset.r] = {});
+    r[el.dataset.f] = el.value.trim();
+  }
+  const alerts = {};
+  for (const el of document.querySelectorAll('#alerts-form [data-a]')) {
+    const v = parseFloat(el.value);
+    if (!Number.isNaN(v)) alerts[el.dataset.a] = v;
+  }
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ roles, alerts }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    setStatus('已写入 team.json，下次调用生效', 'ok');
+  } catch (e) { setStatus('保存失败：' + e.message, 'error'); }
+});
+
+$('export').addEventListener('click', () => { window.location.href = '/api/report'; });
+
+let timer = null;
+function applyQuery(value) {
+  state.query = value;
+  clearTimeout(timer);
+  load(value).catch((e) => setStatus('检索失败：' + e.message, 'error'));
+}
+
+function onQuery(value) {
+  state.query = value;
+  clearTimeout(timer);
+  timer = setTimeout(() => load(value).catch((e) => setStatus('加载失败：' + e.message, 'error')), 180);
+}
+
+// 检索词存 sessionStorage 而不是改 URL：
+// history.replaceState 会被宿主判定为"页面导航"从而中断交互。
+// sessionStorage 同样能跨刷新保留状态，且不触发导航。
+function syncUrl(value) {
+  try {
+    if (value) sessionStorage.setItem('ct-q', value);
+    else sessionStorage.removeItem('ct-q');
+  } catch {}
+}
+$('q1').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); syncUrl(e.target.value); } });
+$('q1').addEventListener('change', (e) => syncUrl(e.target.value));
+$('q2').addEventListener('change', (e) => syncUrl(e.target.value));
+$('q2').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); syncUrl(e.target.value); } });
+$('q1').addEventListener('input', (e) => {
+  $('q2').value = e.target.value;
+  state.query = e.target.value;
+  onQuery(e.target.value);
+});
+$('q1').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); syncUrl(e.target.value); applyQuery(e.target.value); }
+});
+$('q1-search').addEventListener('click', () => { syncUrl($('q1').value); applyQuery($('q1').value); });
+$('q2').addEventListener('input', (e) => {
+  $('q1').value = e.target.value;
+  state.query = e.target.value;
+  onQuery(e.target.value);
+});
+$('q2').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); syncUrl(e.target.value); applyQuery(e.target.value); }
+});
+$('q2-search').addEventListener('click', () => { syncUrl($('q2').value); applyQuery($('q2').value); });
+
+setInterval(() => { $('clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false }); }, 1000);
+$('clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+// 初始 query 从 URL 取，刷新和分享链接都能保持筛选状态。
+let initialQuery = new URLSearchParams(location.search).get('q') ?? '';
+if (!initialQuery) { try { initialQuery = sessionStorage.getItem('ct-q') ?? ''; } catch {} }
+if (initialQuery) { state.query = initialQuery; $('q1').value = initialQuery; $('q2').value = initialQuery; }
+load(initialQuery).catch((e) => setStatus('加载失败：' + e.message, 'error'));
+// 自动刷新只在没有检索词时跑，避免把检索结果冲掉。
+setInterval(() => {
+  if (!state.query) load('').catch((e) => setStatus('自动刷新失败：' + e.message, 'error'));
+}, 15000);
+</script>
+</body>
+</html>

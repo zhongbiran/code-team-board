@@ -1,0 +1,10 @@
+# 运行时数据（由 Code Team 插件产生，不在本仓库）
+config/events.jsonl
+config/usage-ledger.json
+config/lessons.json
+
+tmp-*
+*.tmp
+Thumbs.db
+.DS_Store
+node_modules/

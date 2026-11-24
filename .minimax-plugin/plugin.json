@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "name": "code-team-board",
+  "displayName": "Code Team 控制台",
+  "version": "1.0.0",
+  "description": "Code Team 的可视化控制台：配置 Overmind / Coder 的后端与模型，统计各项目、任务、Skill、模型的调用次数与耗时消耗，导出周报 Markdown。",
+  "author": "钟必然",
+  "icon": "icon.png",
+  "category": "Code",
+  "exampleQueries": [
+    "打开 Code Team 控制台",
+    "Code Team 这个周消耗了多少"
+  ],
+  "apps": [],
+  "mcpServers": [],
+  "skills": []
+}
