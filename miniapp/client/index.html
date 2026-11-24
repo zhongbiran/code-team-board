@@ -399,6 +399,9 @@ button.ghost:hover { background: var(--mcode-surface-muted); }
         <span class="spacer"></span>
       </header>
       <div class="body">
+        <div class="fhint" style="margin-bottom:10px">
+          <span class="tag">同一次调用只计一次（按 invocationId 归组），状态与用量取结果事件</span>
+        </div>
         <div class="search" style="max-width:360px;margin-bottom:12px">
           <span class="icon">⌕</span>
           <input id="q2" type="search" placeholder="检索任意字段" />
@@ -509,7 +512,7 @@ function renderFindings(findings, counts) {
 function renderDim(el, rows, keyLabel) {
   if (!rows.length) { el.innerHTML = '<div class="empty-state"><div>暂无数据</div></div>'; return; }
   const max = Math.max(...rows.map((r) => r.total || 0), 1);
-  el.innerHTML = '<table><thead><tr><th>' + esc(keyLabel) + '</th><th style="text-align:right">次数</th>' +
+  el.innerHTML = '<table><thead><tr><th>' + esc(keyLabel) + '</th><th style="text-align:right">调用次数</th>' +
     '<th style="text-align:right">耗时(s)</th><th style="text-align:right">Token</th><th style="width:32%"></th></tr></thead><tbody>' +
     rows.map((r) => '<tr><td>' + esc(r.label ?? r.key) + '</td>' +
       '<td class="n">' + fmt(r.count) + '</td>' +
@@ -522,7 +525,7 @@ function renderDim(el, rows, keyLabel) {
 
 /* ── 三级树 ── */
 function renderTree(tree) {
-  if (!tree.length) { $('tree').innerHTML = '<div class="empty-state"><div class="big">没有匹配的事件</div><div>换个关键词，或先跑一次 Code Team。</div></div>'; return; }
+  if (!tree.length) { $('tree').innerHTML = '<div class="empty-state"><div class="big">没有匹配的调用记录</div><div>换个关键词，或先跑一次 Code Team。</div></div>'; return; }
   $('tree').innerHTML = tree.map((p) => {
     const pOpen = state.open.has('p:' + p.project);
     const sessions = p.sessions.map((s) => {
@@ -533,21 +536,21 @@ function renderTree(tree) {
         return '<div class="role">' +
           '<div class="rname"><span class="dot" style="background:' + colorOf(r.role) + '"></span>' + esc(r.label) + '</div>' +
           '<div class="rbar"><i style="width:' + Math.round(((r.total || 0) / maxRole) * 100) + '%;background:' + colorOf(r.role) + '"></i></div>' +
-          '<div class="rnum"><span>' + r.count + ' 次</span><span>' + (r.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(r.total) + ' tok</span></div>' +
+          '<div class="rnum"><span>' + r.count + ' 次调用</span><span>' + (r.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(r.total) + ' tok</span></div>' +
           '<div class="rmodels mono">' + esc(models) + '</div>' +
           '</div>';
       }).join('');
       return '<div class="session">' +
         '<div class="s-head" data-p="' + esc(p.project) + '" data-s="' + esc(s.session) + '">' +
         '<span class="caret">▶</span><span class="sname mono">' + esc(String(s.session).slice(0, 26)) + '</span>' +
-        '<span class="smeta"><span>' + s.count + ' 事件</span><span>' + (s.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(s.total) + ' tok</span></span></div>' +
+        '<span class="smeta"><span>' + s.count + ' 次调用</span><span>' + (s.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(s.total) + ' tok</span></span></div>' +
         (sOpen ? '<div class="roles">' + roles + '</div>' : '') +
         '</div>';
     }).join('');
     return '<div class="project" data-open="' + pOpen + '">' +
       '<div class="proj-head" data-p="' + esc(p.project) + '">' +
       '<span class="caret">▶</span><span class="pname">' + esc(p.project) + '</span>' +
-      '<span class="pmeta"><span>' + p.sessions.length + ' 会话</span><span>' + p.count + ' 事件</span><span>' + (p.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(p.total) + ' tok</span></span></div>' +
+      '<span class="pmeta"><span>' + p.sessions.length + ' 会话</span><span>' + p.count + ' 次调用</span><span>' + (p.elapsedSec ?? 0).toFixed(1) + 's</span><span>' + fmt(p.total) + ' tok</span></span></div>' +
       (pOpen ? '<div class="sessions">' + sessions + '</div>' : '') +
       '</div>';
   }).join('');
@@ -555,7 +558,7 @@ function renderTree(tree) {
 
 /* ── 原始事件表 ── */
 function renderRaw(recent) {
-  $('raw-hint').textContent = '最近 ' + recent.length + ' 条';
+  $('raw-hint').textContent = '最近 ' + recent.length + ' 条（逐条事件流：一次调用可能对应多条事件）';
   if (!recent.length) { $('raw-table').innerHTML = '<tbody><tr><td class="dim">暂无事件</td></tr></tbody>'; return; }
   $('raw-table').innerHTML = '<thead><tr><th>时间</th><th>类型</th><th>角色</th><th>模型</th><th>档位</th>' +
     '<th>项目</th><th>会话</th><th>任务</th><th style="text-align:right">耗时</th><th style="text-align:right">Token</th></tr></thead><tbody>' +
@@ -580,6 +583,8 @@ function renderRaw(recent) {
 const EXEC_ROLES = new Set(['worker', 'explore', 'verifier']);
 const ROLE_ORDER = ['overmind', 'coder', 'worker', 'explore', 'verifier'];
 const FIELD_LABEL = { model: '模型', effort: '思考档位', executable: '可执行程序', args: '参数数组' };
+// 契约 1：这两个字段接受自由文本，用输入框；其余字段必须有已证实的取值域才给控件。
+const FREE_TEXT_FIELDS = new Set(['executable', 'args']);
 const PLACEHOLDER = { model: '{model}', effort: '{effort}' };
 
 const cfgState = { model: null, baseline: null, alerts: {} };
@@ -618,15 +623,18 @@ function buildFields(role) {
 /**
  * 能不能编辑：
  * - 后端说 supported 才算；
- * - 在有参数数组的后端上，模型/档位能不能传由参数数组里的完整占位元素决定
- *   （后端能力也按同一条规则判定，所以本地跟着参数走）。
+ * - 外部命令用命令自己的字符串域：参数数组里有完整占位元素就能填；
+ * - 其余字段要有已证实的取值域（values 非空）才给控件——
+ *   契约 2：能力未知时禁止新设非空值，所以值域没证实就只显示当前值。
  */
 function isEditable(role, field) {
   const hasArgs = role.fields.some((f) => f.name === 'args');
   if (hasArgs && PLACEHOLDER[field.name]) {
     return (role.values.args ?? []).includes(PLACEHOLDER[field.name]);
   }
-  return field.state === 'supported';
+  if (field.state !== 'supported') return false;
+  if (FREE_TEXT_FIELDS.has(field.name)) return true;
+  return Array.isArray(field.values) && field.values.length > 0;
 }
 
 function buildConfigModel(payload) {
@@ -737,12 +745,15 @@ function renderField(role, field) {
     if (field.default !== null && field.default !== undefined) hints.push('默认值 ' + esc(showValue(field.default)));
     if (field.required) hints.push('必填');
     if (field.nullable) hints.push('留空表示由调用端决定');
-  } else if (field.state === 'unknown') {
-    control = '<div class="fixed mono">' + esc(showValue(value)) + '</div>';
-    hints.push('<span class="tag">能力未确认，当前值不可编辑</span>');
-  } else {
+  } else if (field.state === 'unsupported') {
     control = renderControl(role, field, value, false);
     hints.push('<span class="tag warn">' + esc(reasonText(role, field)) + '</span>');
+  } else {
+    // 能力未知或取值域没证实：只显示当前值，不给可编辑控件。
+    control = '<div class="fixed mono">' + esc(showValue(value)) + '</div>';
+    hints.push('<span class="tag">' + (field.state === 'unknown'
+      ? '能力未确认，当前值不可编辑'
+      : '取值域未证实，当前值不可编辑') + '</span>');
   }
   const err = role.errors ? role.errors[field.name] : null;
   if (err) hints.push('<span class="tag warn">' + esc(err) + '</span>');
@@ -826,8 +837,8 @@ async function load(query) {
   renderDim($('d-model'), data.byModel, '模型');
   renderDim($('d-backend'), data.byBackend, '后端');
   renderTree(data.tree);
-  $('q2-count').textContent = state.query ? data.totals.events : '';
-  $('tree-hint').textContent = (state.query ? '命中 ' + data.totals.events + ' 条' : '') +
+  $('q2-count').textContent = state.query ? data.totals.events + ' 次调用' : '';
+  $('tree-hint').textContent = (state.query ? '命中 ' + data.totals.events + ' 次调用' : '') +
     ' · ' + data.tree.length + ' 个项目 / ' + data.tree.reduce((n, p) => n + p.sessions.length, 0) + ' 个会话';
   renderRaw(data.recent);
 }

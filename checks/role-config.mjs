@@ -60,6 +60,9 @@ export function describe(role, roleConfig, localContext) {
     hasConfig: !!localContext?.config,
     roleKeys: Object.keys(localContext?.config?.roles ?? {}),
     hasProvider: !!localContext?.config?.provider,
+    ctxKeys: Object.keys(localContext ?? {}).sort(),
+    eventsFile: localContext?.eventsFile ?? null,
+    schemaFile: localContext?.schemaFile ?? null,
   });
   writeFileSync(LOG, JSON.stringify(calls, null, 2));
   if (roleConfig.backend === 'external-command') {
@@ -80,6 +83,44 @@ export function describe(role, roleConfig, localContext) {
       effort: { type: 'string', state: 'supported', nullable: false, required: true, default: 'medium', values: ['low', 'medium', 'high'] },
     },
   };
+}
+`;
+
+// 宿主能力域替身（核心仓 scripts/dispatch-params.mjs 的能力描述接口）。
+const HOST_MODELS = ['minimax/MiniMax-M3', 'minimax/MiniMax-M3.1-Flash'];
+const HOST_EFFORTS = ['low', 'medium', 'high'];
+
+// 约定的接口：capabilitiesFor(role, roleConfig, localContext)
+const STUB_HOST_FOR = `export function capabilitiesFor(role, roleConfig, localContext) {
+  return {
+    id: 'mcode-agent', resume: 'none', output: 'text',
+    fields: {
+      model: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: ${JSON.stringify(HOST_MODELS)} },
+      effort: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: ${JSON.stringify(HOST_EFFORTS)} },
+    },
+  };
+}
+`;
+
+// 核心仓当前实际导出的接口：describeHostCapabilities(config)（state 用 'confirmed'）
+const STUB_HOST_ALT = `export function describeHostCapabilities(config) {
+  const roles = {};
+  for (const [role, rc] of Object.entries(config?.roles ?? {})) {
+    if (rc?.backend !== 'mcode-agent') continue;
+    roles[role] = {
+      backendOptions: ['mcode-agent'],
+      backends: {
+        'mcode-agent': {
+          id: 'mcode-agent', resume: 'none', output: 'text',
+          fields: {
+            model: { type: 'string', state: 'confirmed', nullable: true, required: false, default: null, values: ${JSON.stringify(HOST_MODELS)} },
+            effort: { type: 'string', state: 'confirmed', nullable: true, required: false, default: null, values: ${JSON.stringify(HOST_EFFORTS)} },
+          },
+        },
+      },
+    };
+  }
+  return roles;
 }
 `;
 
@@ -135,14 +176,30 @@ async function api(port, method, body) {
 const paths = (res) => (res.body?.error?.fields ?? []).map((f) => f.path);
 const codes = (res) => (res.body?.error?.fields ?? []).map((f) => f.code);
 
-async function makePluginDir(prefix, { withStub }) {
+async function apiStats(port) {
+  const res = await fetch('http://127.0.0.1:' + port + '/api/stats');
+  const text = await res.text();
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+  return { status: res.status, body: parsed };
+}
+
+// 替身事件流：1 条 call + 一组共享 INV-2 的 dispatch/dispatch-result + 1 条无 invocationId 的历史事件。
+const EVENT_STREAM = [
+  { at: '2026-11-24T02:00:00.000Z', kind: 'call', invocationId: 'INV-1', role: 'overmind', backend: 'codex-cli', model: 'gpt-6.2-astra', effort: 'medium', project: 'demo', session: 'S1', task: 'T1', elapsedSec: 5, ok: true, usage: { input_tokens: 100, output_tokens: 10, cached_input_tokens: 0, reasoning_output_tokens: 0 } },
+  { at: '2026-11-24T02:00:01.000Z', kind: 'dispatch', invocationId: 'INV-2', role: 'worker', backend: 'mcode-agent', model: 'minimax/MiniMax-M3.1-Flash', effort: null, project: 'demo', session: 'S1', task: 'T1', elapsedSec: 0, usage: { input_tokens: 999, output_tokens: 999 } },
+  { at: '2026-11-24T02:00:09.000Z', kind: 'dispatch-result', invocationId: 'INV-2', role: 'worker', backend: 'mcode-agent', model: 'minimax/MiniMax-M3.1-Flash', effort: null, project: 'demo', session: 'S1', task: 'T1', elapsedSec: 4, ok: true, usage: { input_tokens: 50, output_tokens: 5 } },
+  { at: '2026-11-24T02:00:12.000Z', kind: 'codex-call', role: 'coder', backend: 'codex-cli', model: 'gpt-legacy', effort: 'medium', project: 'demo', session: 'S1', task: 'T1', elapsedSec: 2, ok: true, usage: { input_tokens: 7, output_tokens: 3 } },
+];
+
+async function makePluginDir(prefix, { withStub = false, hostStub = null } = {}) {
   const dir = await mkdtemp(join(tmpdir(), prefix));
   await mkdir(join(dir, 'config'), { recursive: true });
   await writeFile(join(dir, 'config', 'team.json'), JSON.stringify(BASE_CONFIG, null, 2) + '\n', 'utf8');
-  if (withStub) {
-    await mkdir(join(dir, 'scripts'), { recursive: true });
-    await writeFile(join(dir, 'scripts', 'decision-backend.mjs'), STUB_DESCRIBE, 'utf8');
-  }
+  if (withStub || hostStub) await mkdir(join(dir, 'scripts'), { recursive: true });
+  if (withStub) await writeFile(join(dir, 'scripts', 'decision-backend.mjs'), STUB_DESCRIBE, 'utf8');
+  if (hostStub === 'for') await writeFile(join(dir, 'scripts', 'dispatch-params.mjs'), STUB_HOST_FOR, 'utf8');
+  if (hostStub === 'alt') await writeFile(join(dir, 'scripts', 'dispatch-params.mjs'), STUB_HOST_ALT, 'utf8');
   return { dir, team: join(dir, 'config', 'team.json') };
 }
 
@@ -158,9 +215,9 @@ async function scenarioDegraded() {
     ok('GET 返回 { ok, config, capabilities }',
       get.status === 200 && get.body?.ok === true && !!get.body?.config && !!get.body?.capabilities,
       'status=' + get.status + ' body=' + JSON.stringify(get.body).slice(0, 160));
-    ok('capabilities 公布执行角色的 model/effort 字段',
-      get.body?.capabilities?.roles?.worker?.backends?.['mcode-agent']?.fields?.model?.state === 'supported'
-      && get.body?.capabilities?.roles?.worker?.backends?.['mcode-agent']?.fields?.effort?.state === 'supported',
+    ok('缺宿主能力源时执行角色的 model/effort 标记为能力未知',
+      get.body?.capabilities?.roles?.worker?.backends?.['mcode-agent']?.fields?.model?.state === 'unknown'
+      && get.body?.capabilities?.roles?.worker?.backends?.['mcode-agent']?.fields?.model?.values === null,
       JSON.stringify(get.body?.capabilities?.roles?.worker));
     ok('capabilities 公布决策角色的后端选项',
       (get.body?.capabilities?.roles?.overmind?.backendOptions ?? []).some((o) => o.id === 'codex-cli'),
@@ -194,12 +251,12 @@ async function scenarioDegraded() {
     ok('只读字段不可改（403）', readonly.status === 403 && paths(readonly).includes('roles.worker.label'),
       'status=' + readonly.status + ' body=' + JSON.stringify(readonly.body));
 
+    // 缺 dispatch-params.mjs → 宿主能力未知 → 禁止新设非空值（契约 2）。
     const writable = await api(app.port, 'POST', { roles: { worker: { model: 'minimax/MiniMax-M3' } } });
-    ok('内置角色可改 model（200）', writable.status === 200 && writable.body?.ok === true,
+    ok('宿主能力未知时新设非空 model → 422 CAPABILITY_UNKNOWN',
+      writable.status === 422 && codes(writable).includes('CAPABILITY_UNKNOWN'),
       'status=' + writable.status + ' body=' + JSON.stringify(writable.body));
-    const afterWritable = JSON.parse(await readFile(team, 'utf8'));
-    ok('改动写回 team.json', afterWritable.roles.worker.model === 'minimax/MiniMax-M3',
-      JSON.stringify(afterWritable.roles.worker));
+    ok('能力未知时配置不被改写', (await sha(team)) === hash0);
 
     const hash1 = await sha(team);
     const atomic = await api(app.port, 'POST', { roles: { explore: { model: 'minimax/MiniMax-M3' }, verifier: { model: 123 } } });
@@ -238,6 +295,11 @@ async function scenarioDegraded() {
     ok('旧客户端原样回传只读值仍可保存', legacy.status === 200 && legacy.body?.ok === true,
       'status=' + legacy.status + ' body=' + JSON.stringify(legacy.body).slice(0, 200));
     ok('旧客户端保存后配置内容不变', (await sha(team)) === hashLegacy);
+
+    const cleared = await api(app.port, 'POST', { roles: { worker: { model: null } } });
+    ok('能力未知时清空 model（null）仍可保存', cleared.status === 200
+      && JSON.parse(await readFile(team, 'utf8')).roles.worker.model === null,
+      'status=' + cleared.status + ' body=' + JSON.stringify(cleared.body));
   } finally {
     app.stop();
     await rm(dir, { recursive: true, force: true });
@@ -247,7 +309,7 @@ async function scenarioDegraded() {
 // ── 场景 B：后端能力由 describe 提供 ──────────────────────────────
 async function scenarioWithDescribe() {
   console.log('场景 B：后端能力来自核心插件的 describe');
-  const { dir, team } = await makePluginDir('ct-role-config-b-', { withStub: true });
+  const { dir, team } = await makePluginDir('ct-role-config-b-', { withStub: true, hostStub: 'for' });
   const app = await startServer(dir);
   try {
     const get = await api(app.port, 'GET');
@@ -268,6 +330,37 @@ async function scenarioWithDescribe() {
     ok('describe 收到的 localContext 含 provider（preflight 判 provider 用）',
       calls.every((c) => c.hasProvider === true),
       JSON.stringify(calls.map((c) => c.hasProvider)));
+    ok('localContext 键表统一为 { config, cwd, eventsFile, schemaFile }',
+      calls.every((c) => ['config', 'cwd', 'eventsFile', 'schemaFile'].every((k) => c.ctxKeys.includes(k))),
+      JSON.stringify(calls.map((c) => c.ctxKeys)));
+    ok('eventsFile / schemaFile 由 PLUGIN_DIR 推导（不硬编码绝对路径）',
+      calls.every((c) => typeof c.eventsFile === 'string' && c.eventsFile.startsWith(dir)
+        && c.eventsFile.endsWith('events.jsonl')
+        && typeof c.schemaFile === 'string' && c.schemaFile.startsWith(dir)
+        && c.schemaFile.endsWith('plan-schema.json')),
+      JSON.stringify(calls.map((c) => [c.eventsFile, c.schemaFile])));
+
+    // 执行角色的能力域必须来自核心仓的 dispatch-params.mjs，不是前端写死的。
+    const hostFields = get.body?.capabilities?.roles?.worker?.backends?.['mcode-agent']?.fields;
+    ok('执行角色的 model/effort 候选来自宿主能力描述',
+      Array.isArray(hostFields?.model?.values) && hostFields.model.values.includes('minimax/MiniMax-M3.1-Flash')
+      && Array.isArray(hostFields?.effort?.values) && hostFields.effort.values.includes('medium'),
+      JSON.stringify(hostFields));
+
+    const hostOk = await api(app.port, 'POST', { roles: { worker: { model: 'minimax/MiniMax-M3' } } });
+    ok('宿主能力域内的 model 可保存', hostOk.status === 200
+      && JSON.parse(await readFile(team, 'utf8')).roles.worker.model === 'minimax/MiniMax-M3',
+      'status=' + hostOk.status + ' body=' + JSON.stringify(hostOk.body).slice(0, 200));
+
+    const hostBad = await api(app.port, 'POST', { roles: { worker: { model: 'totally-made-up/model-x' } } });
+    ok('宿主能力域外的 model → 422 CAPABILITY_UNKNOWN（不再假装保存成功）',
+      hostBad.status === 422 && codes(hostBad).includes('CAPABILITY_UNKNOWN'),
+      'status=' + hostBad.status + ' body=' + JSON.stringify(hostBad.body));
+
+    const hostBadEffort = await api(app.port, 'POST', { roles: { worker: { effort: 'super-ultra-9000' } } });
+    ok('宿主能力域外的 effort → 422 CAPABILITY_UNKNOWN',
+      hostBadEffort.status === 422 && codes(hostBadEffort).includes('CAPABILITY_UNKNOWN'),
+      'status=' + hostBadEffort.status + ' body=' + JSON.stringify(hostBadEffort.body));
     ok('外部命令后端也用 describe 形状',
       get.body?.capabilities?.roles?.overmind?.backends?.['external-command']?.fields?.executable?.required === true,
       JSON.stringify(get.body?.capabilities?.roles?.overmind?.backends?.['external-command']?.fields?.executable));
@@ -387,9 +480,79 @@ async function scenarioHistoricalBackend() {
   }
 }
 
+// ── 场景 D：看板按 invocationId 计一次 ───────────────────────────
+async function scenarioInvocationCounting() {
+  console.log('场景 D：看板按 invocationId 计一次');
+  const { dir } = await makePluginDir('ct-role-config-d-', { withStub: false });
+  await writeFile(join(dir, 'config', 'events.jsonl'),
+    EVENT_STREAM.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8');
+  const app = await startServer(dir);
+  try {
+    const stats = await apiStats(app.port);
+    ok('GET /api/stats 返回 200', stats.status === 200, 'status=' + stats.status);
+    ok('totals.calls = 2（INV-1 的 call + 一条无 invocationId 的历史事件）',
+      stats.body?.totals?.calls === 2, JSON.stringify(stats.body?.totals));
+    ok('totals.dispatches = 1（共享 INV-2 的 dispatch/dispatch-result 只计一次）',
+      stats.body?.totals?.dispatches === 1, JSON.stringify(stats.body?.totals));
+
+    const byModel = Object.fromEntries((stats.body?.byModel ?? []).map((r) => [r.key, r]));
+    ok('byModel 里 worker 的模型只计 1 次',
+      byModel['minimax/MiniMax-M3.1-Flash']?.count === 1,
+      JSON.stringify(byModel['minimax/MiniMax-M3.1-Flash']));
+    ok('用量取结果事件，只计一份（50+5，不是两条 dispatch 的和）',
+      byModel['minimax/MiniMax-M3.1-Flash']?.total === 55,
+      JSON.stringify(byModel['minimax/MiniMax-M3.1-Flash']));
+
+    const byRole = Object.fromEntries((stats.body?.byRole ?? []).map((r) => [r.key, r]));
+    ok('byRole 里 worker 只计 1 次', byRole.worker?.count === 1, JSON.stringify(byRole.worker));
+
+    ok('历史无 invocationId 的事件沿用逐条计数',
+      byModel['gpt-legacy']?.count === 1 && byRole.coder?.count === 1,
+      JSON.stringify([byModel['gpt-legacy'], byRole.coder]));
+
+    const workerNode = (stats.body?.tree?.[0]?.sessions?.[0]?.roles ?? []).find((r) => r.role === 'worker');
+    ok('树里 worker 也只计 1 次', workerNode?.count === 1, JSON.stringify(workerNode));
+  } finally {
+    app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// ── 场景 E：核心仓当前导出的 describeHostCapabilities 也能用 ────────
+async function scenarioHostCapabilityFallback() {
+  console.log('场景 E：宿主能力来自 describeHostCapabilities');
+  const { dir, team } = await makePluginDir('ct-role-config-e-', { withStub: false, hostStub: 'alt' });
+  const app = await startServer(dir);
+  try {
+    const get = await api(app.port, 'GET');
+    const fields = get.body?.capabilities?.roles?.worker?.backends?.['mcode-agent']?.fields;
+    ok('宿主能力的 state 归一成契约词表 supported',
+      fields?.model?.state === 'supported' && fields?.effort?.state === 'supported',
+      JSON.stringify(fields));
+    ok('宿主能力的取值域照原样公布',
+      Array.isArray(fields?.model?.values) && fields.model.values.includes('minimax/MiniMax-M3.1-Flash'),
+      JSON.stringify(fields?.model));
+
+    const bad = await api(app.port, 'POST', { roles: { worker: { model: 'totally-made-up/model-x' } } });
+    ok('能力域外的 model → 422 CAPABILITY_UNKNOWN',
+      bad.status === 422 && codes(bad).includes('CAPABILITY_UNKNOWN'),
+      'status=' + bad.status + ' body=' + JSON.stringify(bad.body));
+
+    const good = await api(app.port, 'POST', { roles: { worker: { model: 'minimax/MiniMax-M3' } } });
+    ok('能力域内的 model 可保存', good.status === 200
+      && JSON.parse(await readFile(team, 'utf8')).roles.worker.model === 'minimax/MiniMax-M3',
+      'status=' + good.status + ' body=' + JSON.stringify(good.body).slice(0, 200));
+  } finally {
+    app.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 await scenarioDegraded();
 await scenarioWithDescribe();
 await scenarioHistoricalBackend();
+await scenarioInvocationCounting();
+await scenarioHostCapabilityFallback();
 
 if (failures) {
   console.log('\nFAIL role-config (' + failures + ' 项未通过)');

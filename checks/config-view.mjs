@@ -32,10 +32,17 @@ const ok = (name, cond, detail = '') => {
 const EXEC_ROLES = ['worker', 'explore', 'verifier'];
 const DECISION_ROLES = ['overmind', 'coder'];
 
+// 执行角色的真实取值域（由核心仓的宿主取证给出，前端只读不改）。
+const EXEC_DOMAINS = {
+  worker: { model: ['fixture-model-a', 'fixture-model-b'], effort: null },
+  explore: { model: null, effort: ['low', 'medium', 'high'] },
+  verifier: { model: null, effort: null },
+};
+
 const baseConfig = () => ({
   roles: {
-    overmind: { label: 'Overmind', kind: 'decision', backend: 'codex-cli', model: 'fixture-model-a', effort: 'medium', agent: null, note: '规划与拆包' },
-    coder: { label: 'Coder', kind: 'decision', backend: 'codex-cli', model: 'fixture-model-a', effort: 'medium', agent: null, note: '代码方向' },
+    overmind: { label: 'Overmind', kind: 'decision', backend: 'codex-cli', model: 'decision-model-x', effort: 'medium', agent: null, note: '规划与拆包' },
+    coder: { label: 'Coder', kind: 'decision', backend: 'codex-cli', model: 'decision-model-x', effort: 'medium', agent: null, note: '代码方向' },
     worker: { label: 'Worker', kind: 'execution', backend: 'mcode-agent', model: 'fixture-model-a', effort: null, agent: 'worker', note: '实现' },
     explore: { label: 'Explore', kind: 'execution', backend: 'mcode-agent', model: 'fixture-model-a', effort: null, agent: 'explore', note: '取证' },
     verifier: { label: 'Verifier', kind: 'verification', backend: 'mcode-agent', model: 'fixture-model-a', effort: null, agent: 'verifier', note: '验收' },
@@ -57,7 +64,7 @@ const makeCapabilities = (config, extraExecField) => {
         'codex-cli': {
           id: 'codex-cli', resume: 'thread-id', output: 'codex-jsonl',
           fields: {
-            model: { type: 'string', state: 'supported', nullable: false, required: true, default: 'fixture-model-a', values: ['fixture-model-a', 'fixture-model-b'] },
+            model: { type: 'string', state: 'supported', nullable: false, required: true, default: 'decision-model-x', values: ['decision-model-x', 'decision-model-y'] },
             effort: { type: 'string', state: 'supported', nullable: false, required: true, default: 'medium', values: ['low', 'medium', 'high'] },
           },
         },
@@ -74,10 +81,13 @@ const makeCapabilities = (config, extraExecField) => {
     };
   }
   for (const role of EXEC_ROLES) {
+    // 内置角色的取值域由 API 给：worker 有值域 -> 下拉；
+    // worker.effort / explore.model / verifier.model 值域没证实 -> 只读；
+    // verifier.effort 能力未知 -> 只读。
+    const domain = EXEC_DOMAINS[role];
     const fields = {
-      model: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: null },
-      // verifier 的档位域宿主还没证实：能力未知的字段只能看不能改。
-      effort: { type: 'string', state: role === 'verifier' ? 'unknown' : 'supported', nullable: true, required: false, default: null, values: null },
+      model: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: domain.model },
+      effort: { type: 'string', state: role === 'verifier' ? 'unknown' : 'supported', nullable: true, required: false, default: null, values: domain.effort },
     };
     if (extraExecField) {
       fields.executable = { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: null };
@@ -98,7 +108,11 @@ const statsFixture = () => ({
   },
   findings: [],
   findingCounts: { danger: 0, warning: 0, info: 0 },
-  byProject: [], byRole: [], byModel: [], byBackend: [], bySkill: [], byPlugin: [], byDay: [],
+  byProject: [{ key: 'demo', label: 'demo', count: 2, elapsedSec: 1.2, total: 15 }],
+  byRole: [{ key: 'overmind', label: 'Overmind', count: 2, elapsedSec: 1.2, total: 15 }],
+  byModel: [{ key: 'decision-model-x', label: 'decision-model-x', count: 2, elapsedSec: 1.2, total: 15 }],
+  byBackend: [{ key: 'codex-cli', label: 'codex-cli', count: 2, elapsedSec: 1.2, total: 15 }],
+  bySkill: [], byPlugin: [], byDay: [],
   tree: [{
     project: 'demo', count: 1, elapsedSec: 1.2, total: 15,
     sessions: [{
@@ -121,12 +135,15 @@ const parseFields = (html) => {
     const field = /data-f="([^"]*)"/.exec(attrs);
     if (!role || !field) continue;
     let value = '';
+    let options = [];
     if (tag === 'select' || tag === 'textarea') {
       const end = html.indexOf('</' + tag + '>', m.index);
       const inner = end > -1 ? html.slice(m.index, end) : '';
       if (tag === 'select') {
         const sel = /<option value="([^"]*)"[^>]*selected/.exec(inner);
         value = sel ? sel[1] : '';
+        options = (inner.match(/<option value="([^"]*)"/g) || [])
+          .map((o) => /value="([^"]*)"/.exec(o)[1]);
       } else {
         value = inner.split('>').slice(1).join('>').trim();
       }
@@ -135,7 +152,7 @@ const parseFields = (html) => {
       value = v ? v[1] : '';
     }
     out.push({
-      tag: tag, role: role[1], field: field[1], value: value,
+      tag: tag, role: role[1], field: field[1], value: value, options: options,
       dataset: { r: role[1], f: field[1] },
       disabled: attrs.indexOf(' disabled') > -1,
     });
@@ -295,16 +312,24 @@ ok('页面写明默认值',
 ok('页面写明改动从哪次调用开始生效',
   h.rolesHtml().indexOf('开始生效') > -1);
 
-const verifierEffort = fields.filter((f) => f.role === 'verifier' && f.field === 'effort');
-ok('能力未知的字段不渲染成可编辑控件',
-  verifierEffort.length === 0 || verifierEffort.every((f) => f.disabled),
-  JSON.stringify(verifierEffort));
-ok('能力未知的字段写明当前值不可编辑',
-  h.rolesHtml().indexOf('能力未确认') > -1);
-const workerEffort = fields.filter((f) => f.role === 'worker' && f.field === 'effort');
-ok('能力已知的内置字段仍然可编辑',
-  workerEffort.length === 1 && !workerEffort[0].disabled,
-  JSON.stringify(workerEffort));
+// D-3：执行角色的取值域来自 API，不是前端写死的
+const workerModel = fields.find((f) => f.role === 'worker' && f.field === 'model');
+ok('执行角色的模型渲染成下拉，选项就是 capabilities.values',
+  !!workerModel && workerModel.tag === 'select'
+  && workerModel.options.join(',') === 'fixture-model-a,fixture-model-b',
+  JSON.stringify(workerModel));
+const decisionModel = fields.find((f) => f.role === 'overmind' && f.field === 'model');
+ok('决策角色的模型选项来自 describe 的取值域',
+  !!decisionModel && decisionModel.tag === 'select'
+  && decisionModel.options.join(',') === 'decision-model-x,decision-model-y',
+  JSON.stringify(decisionModel));
+const noDomain = fields.filter((f) => EXEC_ROLES.indexOf(f.role) > -1
+  && (f.field === 'model' ? EXEC_DOMAINS[f.role].model === null : EXEC_DOMAINS[f.role].effort === null));
+ok('取值域未证实或能力未知的字段不渲染任何可编辑控件',
+  noDomain.length === 0,
+  noDomain.map((f) => f.role + '.' + f.field).join(', '));
+ok('取值域未证实 / 能力未知的字段写明当前值不可编辑',
+  h.rolesHtml().indexOf('取值域未证实') > -1 && h.rolesHtml().indexOf('能力未确认') > -1);
 
 // 换调用方式
 h.change('overmind', 'backend', 'external-command');
@@ -330,7 +355,7 @@ ok('参数里有 {model} 占位元素后模型字段可编辑',
   JSON.stringify(modelWithPlaceholder));
 
 h.change('overmind', 'executable', 'local-planner');
-h.change('overmind', 'model', 'fixture-model-b');
+h.change('overmind', 'model', 'decision-model-y');
 h.change('overmind', 'effort', 'high');
 await h.save();
 
@@ -350,6 +375,9 @@ ok('保存只发已改的可写字段：没改的内置角色一个字段都没�
 ok('保存只发已改的可写字段：没改的决策角色没提交',
   !!post && post.roles && post.roles.coder === undefined,
   JSON.stringify(post && post.roles));
+ok('下拉里选的模型按原样提交',
+  !!post && post.roles && post.roles.overmind && post.roles.overmind.model === 'decision-model-y',
+  JSON.stringify(post && post.roles && post.roles.overmind));
 
 // 重开页面（同一份已保存配置，重新渲染一次）
 const h2 = createHarness(script, store, (s) => makeCapabilities(s, false));
@@ -368,6 +396,17 @@ ok('统计详情的三级树仍然渲染',
   htmlOf(h, 'tree').length > 0);
 ok('统计详情的原始事件表仍然渲染',
   htmlOf(h, 'raw-table').length > 0);
+
+// D-2：看板口径改成"调用次数"——同一次调用只计一次
+ok('统计详情的计数写成"调用次数"',
+  htmlOf(h, 'tree').indexOf('次调用') > -1 && htmlOf(h, 'tree').indexOf(' 事件<') < 0,
+  htmlOf(h, 'tree').slice(0, 240));
+ok('维度表的计数列标题是"调用次数"',
+  htmlOf(h, 'd-model').indexOf('调用次数') > -1);
+ok('页面写明同一次调用只计一次',
+  clientHtml.indexOf('同一次调用只计一次') > -1);
+ok('页面不再把调用次数写成事件数',
+  clientHtml.indexOf(' 事件</span>') < 0 && clientHtml.indexOf('事件数') < 0);
 ok('三个视图的切换入口还在',
   clientHtml.indexOf('t-findings') > -1 && clientHtml.indexOf('t-tree') > -1 && clientHtml.indexOf('t-config') > -1);
 
@@ -419,6 +458,8 @@ ok('必填字段留空时说明是哪个字段',
 const BRANDS = ['codex', 'gpt-', 'openai', 'claude', 'sonnet', 'opus', 'haiku', 'minimax/'];
 const clientHits = BRANDS.filter((t) => clientHtml.toLowerCase().indexOf(t) > -1);
 ok('页面文案没有写死模型品牌', clientHits.length === 0, clientHits.join(', '));
+ok('前端没有硬编码的能力表或模型目录',
+  clientHtml.indexOf('EXEC_FIELDS') < 0 && clientHtml.indexOf('EXEC_DOMAINS') < 0);
 
 const plugin = JSON.parse(await readFile(join(ROOT, '.minimax-plugin', 'plugin.json'), 'utf8'));
 const pluginText = (plugin.description || '') + ' ' + (plugin.exampleQueries || []).join(' ');

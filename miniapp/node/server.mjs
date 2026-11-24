@@ -12,6 +12,7 @@ const PLUGIN_DIR = process.env.CODE_TEAM_PLUGIN_DIR
   || join(process.env.USERPROFILE || process.env.HOME || '', '.minimax', 'plugins', 'code-team');
 const EVENTS_FILE = join(PLUGIN_DIR, 'config', 'events.jsonl');
 const TEAM_CONFIG = join(PLUGIN_DIR, 'config', 'team.json');
+const SCHEMA_FILE = join(PLUGIN_DIR, 'config', 'plan-schema.json');
 const LESSONS_FILE = join(PLUGIN_DIR, 'config', 'lessons.json');
 
 function readEvents() {
@@ -187,6 +188,31 @@ function diagnose(events, cfg, query) {
 }
 
 /**
+ * 按 invocationId 把事件归组成"一次调用"。
+ * 契约 2：看板计数按 invocationId 每次调用一次，完成状态与用量取结果事件。
+ * 没有 invocationId 的历史事件逐条保留（沿用原读取逻辑）。
+ */
+function groupEvents(events) {
+  const groups = [];
+  const byId = new Map();
+  for (const e of events) {
+    const id = e?.invocationId;
+    if (!id) { groups.push([e]); continue; }
+    let group = byId.get(id);
+    if (!group) { group = []; byId.set(id, group); groups.push(group); }
+    group.push(e);
+  }
+  return groups.map((group) => {
+    if (group.length === 1) return group[0];
+    const result = group.findLast((e) => e.kind === 'dispatch-result')
+      ?? group.findLast((e) => e.ok !== undefined)
+      ?? group[group.length - 1];
+    const usage = result.usage ?? group.findLast((e) => e.usage)?.usage;
+    return { ...result, usage };
+  });
+}
+
+/**
  * 三级结构：项目 → 会话 → 角色。
  * 这是"Code Team 到底做了什么"的答案。
  */
@@ -257,11 +283,13 @@ function buildTree(events, cfg, query) {
 }
 
 function buildStats(events, cfg, query) {
-  const filtered = query ? events.filter((e) => {
-    const q = query.trim().toLowerCase();
-    return [e.project, e.session, e.task, e.role, e.model, e.backend, e.skill, e.plugin]
-      .some((v) => String(v ?? '').toLowerCase().includes(q));
-  }) : events;
+  // 计数按 invocationId 归组后的"一次调用"来；原始事件表仍逐条展示。
+  const grouped = groupEvents(events);
+  const q = query ? query.trim().toLowerCase() : '';
+  const matches = (e) => !q || [e.project, e.session, e.task, e.role, e.model, e.backend, e.skill, e.plugin]
+    .some((v) => String(v ?? '').toLowerCase().includes(q));
+  const filtered = grouped.filter(matches);
+  const rawFiltered = events.filter(matches);
 
   const calls = filtered.filter((e) => e.kind === 'codex-call' || e.kind === 'call');
   const dispatches = filtered.filter((e) => e.kind === 'dispatch' || e.kind === 'dispatch-result');
@@ -301,7 +329,7 @@ function buildStats(events, cfg, query) {
   }
 
   // 诊断只在检索命中的会话上做：检索是"缩小问题范围"，不是"看全部问题"。
-  const findings = diagnose(events, cfg, query);
+  const findings = diagnose(grouped, cfg, query);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -335,8 +363,8 @@ function buildStats(events, cfg, query) {
     byProject: byDim((e) => e.project),
     byDay: [...byDayMap.values()].sort((a, b) => a.key.localeCompare(b.key)),
     // 原始事件：最近的在前，供"原始事件"表使用。
-    recent: filtered.slice(-50).reverse(),
-    tree: buildTree(events, cfg, query),
+    recent: rawFiltered.slice(-50).reverse(),
+    tree: buildTree(grouped, cfg, query),
   };
 }
 
@@ -422,10 +450,11 @@ const SUPPORTED_BACKENDS = ['codex-cli', 'external-command'];
 const EXEC_BACKEND = 'mcode-agent';
 const ROLE_MODEL_DEFAULT = { overmind: 'gpt-6.2-astra', coder: 'gpt-6.2-sol' };
 const DEFAULT_EFFORT = 'medium';
-// 执行角色的 model/effort 由宿主在派工时决定可用域，这里只公布"可编辑"这一事实。
-const EXEC_FIELDS = {
-  model: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: null },
-  effort: { type: 'string', state: 'supported', nullable: true, required: false, default: null, values: null },
+// 宿主能力未知时的占位形状：字段照旧公布，但状态是 unknown（前端只显示当前值，不可编辑）。
+// 真实的取值域只能来自核心仓的证据，不在本仓库另造一份。
+const EXEC_FIELDS_UNKNOWN = {
+  model: { type: 'string', state: 'unknown', nullable: true, required: false, default: null, values: null },
+  effort: { type: 'string', state: 'unknown', nullable: true, required: false, default: null, values: null },
 };
 
 const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -468,12 +497,18 @@ function loadDecisionBackend() {
   return decisionBackendCache;
 }
 
+// 契约词表是 supported/unsupported/unknown；核心仓的宿主能力用 confirmed，一并归一。
+function normalizeState(state) {
+  if (state === 'confirmed') return 'supported';
+  return state === 'supported' || state === 'unsupported' ? state : 'unknown';
+}
+
 function normalizeFields(fields) {
   const out = {};
   for (const [name, raw] of Object.entries(fields ?? {})) {
     out[name] = {
       type: raw?.type ?? 'string',
-      state: raw?.state ?? 'unknown',
+      state: normalizeState(raw?.state),
       nullable: raw?.nullable ?? false,
       required: raw?.required ?? false,
       default: raw?.default ?? null,
@@ -481,6 +516,16 @@ function normalizeFields(fields) {
     };
   }
   return out;
+}
+
+/** 核心仓三处统一的 localContext 键表：{ config, cwd, eventsFile, schemaFile }。 */
+function localContextFor(teamConfig) {
+  return {
+    config: teamConfig ?? null,
+    cwd: process.cwd(),
+    eventsFile: EVENTS_FILE,
+    schemaFile: SCHEMA_FILE,
+  };
 }
 
 /** 读一次 describe：成功返回契约 1 的形状，失败返回可操作的错误信息。 */
@@ -494,12 +539,7 @@ async function describeBackend(role, roleConfig, teamConfig) {
     };
   }
   try {
-    const shape = await backend.describe(role, roleConfig, {
-      config: teamConfig ?? null,
-      cwd: process.cwd(),
-      env: process.env,
-      pluginDir: PLUGIN_DIR,
-    });
+    const shape = await backend.describe(role, roleConfig, localContextFor(teamConfig));
     if (!isPlainObject(shape) || !isPlainObject(shape.fields)) {
       throw new Error('describe 返回的不是契约形状');
     }
@@ -520,6 +560,58 @@ async function describeBackend(role, roleConfig, teamConfig) {
   }
 }
 
+let dispatchParamsCache = null;
+
+/** 加载核心仓的宿主能力域。缺文件/版本过旧就是能力未知，不崩。 */
+function loadDispatchParams() {
+  if (!dispatchParamsCache) {
+    const file = join(PLUGIN_DIR, 'scripts', 'dispatch-params.mjs');
+    dispatchParamsCache = import(pathToFileURL(file).href)
+      .then((mod) => ({ ok: true, mod }))
+      .catch((error) => ({ ok: false, error }));
+  }
+  return dispatchParamsCache;
+}
+
+/**
+ * 执行角色的 model/effort 能力域：只能来自核心仓的证据。
+ * 拿不到就是"能力未知"——调用方据此禁止新设非空值。
+ */
+async function hostCapabilitiesFor(role, roleConfig, teamConfig) {
+  const loaded = await loadDispatchParams();
+  if (!loaded.ok) {
+    return {
+      ok: false,
+      message: '核心插件缺少 scripts/dispatch-params.mjs（版本过旧），读不到 '
+        + role + ' 的宿主能力域：' + (loaded.error?.message ?? loaded.error),
+    };
+  }
+  const mod = loaded.mod;
+  try {
+    let shape = null;
+    if (typeof mod.capabilitiesFor === 'function') {
+      shape = await mod.capabilitiesFor(role, roleConfig, localContextFor(teamConfig));
+    } else if (typeof mod.describeHostCapabilities === 'function') {
+      const roles = await mod.describeHostCapabilities(teamConfig ?? {});
+      shape = roles?.[role]?.backends?.[EXEC_BACKEND];
+    }
+    if (!isPlainObject(shape) || !isPlainObject(shape.fields)) {
+      return { ok: false, message: '核心插件的 dispatch-params.mjs 没有给出 ' + role + ' 的能力域' };
+    }
+    return {
+      ok: true,
+      shape: {
+        id: shape.id ?? EXEC_BACKEND,
+        fields: normalizeFields(shape.fields),
+        resume: shape.resume ?? 'none',
+        output: shape.output ?? 'text',
+      },
+    };
+  } catch (error) {
+    return { ok: false, message: '读 ' + role + ' 的宿主能力域失败：' + (error?.message ?? error) };
+  }
+}
+
 /** GET 的 capabilities：每个角色给可选后端与每个后端的字段能力。 */
 async function buildCapabilities(config) {
   const roles = {};
@@ -527,12 +619,21 @@ async function buildCapabilities(config) {
   for (const role of ROLE_KEYS) {
     const roleConfig = isPlainObject(config?.roles?.[role]) ? config.roles[role] : {};
     if (!DECISION_ROLES.has(role)) {
-      roles[role] = {
-        backendOptions: [{ id: EXEC_BACKEND, label: 'MCode 子代理', available: true, reason: null }],
-        backends: {
-          [EXEC_BACKEND]: { id: EXEC_BACKEND, fields: EXEC_FIELDS, resume: 'none', output: 'text' },
-        },
-      };
+      const host = await hostCapabilitiesFor(role, roleConfig, config);
+      if (host.ok) {
+        roles[role] = {
+          backendOptions: [{ id: EXEC_BACKEND, label: 'MCode 子代理', available: true, reason: null }],
+          backends: { [EXEC_BACKEND]: host.shape },
+        };
+      } else {
+        roles[role] = {
+          backendOptions: [{ id: EXEC_BACKEND, label: 'MCode 子代理', available: false, reason: host.message }],
+          backends: {
+            [EXEC_BACKEND]: { id: EXEC_BACKEND, fields: EXEC_FIELDS_UNKNOWN, resume: 'none', output: 'text' },
+          },
+        };
+        degraded ??= { code: 'HOST_CAPABILITY_UNAVAILABLE', message: host.message };
+      }
       continue;
     }
     const backends = {};
@@ -618,7 +719,9 @@ async function planConfigUpdate(current, patch) {
 
   for (const { role, roleConfig, changes } of planned) {
     if (!DECISION_ROLES.has(role)) {
-      // 执行角色：只有 model/effort，值要么 null（派工省略）要么非空字符串。
+      // 执行角色：只有 model/effort，值要么 null（派工省略），要么落在宿主证实的域里。
+      const host = await hostCapabilitiesFor(role, roleConfig, current);
+      const hostFields = host.ok ? host.shape.fields : {};
       for (const [field, value] of Object.entries(changes)) {
         const path = 'roles.' + role + '.' + field;
         if (value === null) continue;
@@ -632,6 +735,20 @@ async function planConfigUpdate(current, patch) {
         }
         if (hasNul(value)) {
           invalid.push(fieldError(path, 'INVALID_VALUE', field + ' 不能含 NUL'));
+          continue;
+        }
+        // 没有已证实的闭集就不许新设非空值：否则页面显示保存成功，派工时却被丢弃。
+        const domain = Array.isArray(hostFields[field]?.values) ? hostFields[field].values : null;
+        if (!domain || !domain.length) {
+          invalid.push(fieldError(
+            path,
+            'CAPABILITY_UNKNOWN',
+            '读不到 ' + field + ' 的宿主能力域（核心插件缺少 scripts/dispatch-params.mjs），不能新设非空值',
+          ));
+          continue;
+        }
+        if (!domain.includes(value)) {
+          invalid.push(fieldError(path, 'CAPABILITY_UNKNOWN', field + ' 不在宿主证实的取值域内'));
           continue;
         }
       }
